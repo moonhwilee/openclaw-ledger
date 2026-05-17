@@ -1,25 +1,39 @@
 # OpenClaw Ledger
 
-OpenClaw Ledger is a small recovery helper for long-running OpenClaw work. It records progress, waits, verification, failures, and visible report delivery so an interrupted session can recover safely.
+OpenClaw Ledger is a small recovery safety net for OpenClaw automation. It records progress, waits, verification, failures, and visible report delivery so interrupted work can be resumed without guessing.
 
-Most users do not run Ledger commands by hand. Install or wire it into your OpenClaw workflow, then let the orchestrator record work before side effects, update progress during long tasks, and produce recovery packets when work becomes stale.
+Why it exists: long-running agent work can be interrupted by a session stop, Gateway restart, model failure, network issue, or missed Telegram delivery. Without a ledger, recovery has to infer what happened from chat history and logs. That can lead to duplicate work, repeated side effects, or a task that finished internally but was never reported to the user.
+
+Most users do not run Ledger commands by hand. Install or wire it into your OpenClaw workflow, then let the orchestrator record work before side effects, update progress while work is active, and produce recovery packets when work becomes stale.
+
+## When To Use It
+
+Use Ledger for work where interruption would make recovery unsafe or confusing:
+
+- file edits, commits, pushes, or generated artifacts
+- subagents, browser automation, cron, Gateway, or external systems
+- user approval gates or waiting states
+- verification-heavy work where completion must be reported
+- any task where repeating the same action could cause duplicate or risky side effects
+
+Simple one-shot answers usually do not need Ledger.
 
 ## Flow
 
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "11px"}, "flowchart": {"nodeSpacing": 24, "rankSpacing": 28}} }%%
-flowchart TD
-  A[Start entry] --> B[Record progress]
-  B --> C{Waiting?}
-  C -- yes --> D[Record wait]
-  C -- no --> E[Record verify]
-  D --> B
-  E --> F{Complete?}
-  F -- no --> B
-  F -- yes --> G[Visible report]
-  G --> H[Mark reported]
-  B --> I[Stale scan]
-  I --> J[Recovery packet]
+%%{init: {"themeVariables": {"fontSize": "11px"}, "flowchart": {"nodeSpacing": 22, "rankSpacing": 24}} }%%
+flowchart LR
+  subgraph R[Record]
+    A[Start] --> B[Progress] --> C[Wait / verify]
+  end
+  subgraph D[Detect]
+    E[Stale scan] --> F[Recovery packet]
+  end
+  subgraph C2[Recover]
+    G[Reconcile state] --> H[Visible report] --> I[Mark reported]
+  end
+  C --> E
+  F --> G
 ```
 
 ## What It Does
@@ -32,8 +46,6 @@ flowchart TD
 
 ## How It Is Used
 
-Ledger is usually called by automation, not by the end user directly.
-
 Install the CLI:
 
 ~~~bash
@@ -42,27 +54,24 @@ curl -fsSL https://raw.githubusercontent.com/moonhwilee/openclaw-ledger/main/ins
 
 Typical flow:
 
-1. A long-running task starts.
+1. A task with meaningful state or side effects starts.
 2. The orchestrator creates a Ledger entry.
 3. Progress, waits, verification, and failures are appended as events.
 4. If the session stops responding, a scan produces a recovery packet.
 5. The recovered session inspects the current state, continues safely, sends one visible completion report, and records that the report was sent.
 
-Manual commands are useful for testing or custom integrations:
+For command details:
 
 ~~~bash
-python3 src/work_ledger.py start --work-id example-work --request-summary "Implement and verify the requested change" --owner-session-key agent:main:example --visible-delivery '{"channel":"telegram","target":"example"}'
-python3 src/work_ledger.py progress --work-id example-work --note "Implementation started"
-python3 src/work_ledger.py verify --work-id example-work --verification '{"tests":"passed"}'
-python3 src/work_ledger.py complete --work-id example-work --note "Work completed"
-python3 src/work_ledger.py scan
+openclaw-ledger --help
+openclaw-ledger scan
 ~~~
 
 ## Repository Layout
 
 - src/work_ledger.py - CLI implementation.
 - tests/smoke/work_ledger_smoke.py - behavior smoke tests.
-- docs/ledger.md - current behavior and recovery policy.
+- docs/ledger.md - current behavior, recovery policy, and command reference.
 
 ## Local Tests
 

@@ -64,6 +64,18 @@ The main entry point is:
 python3 src/work_ledger.py --help
 ```
 
+Most users do not need these commands directly. They are mainly for orchestrator integrations, smoke tests, and custom recovery wiring.
+
+Example command sequence:
+
+```bash
+python3 src/work_ledger.py start --work-id example-work --request-summary "Implement and verify the requested change" --owner-session-key agent:main:example --visible-delivery '{"channel":"telegram","target":"example"}'
+python3 src/work_ledger.py progress --work-id example-work --note "Implementation started"
+python3 src/work_ledger.py verify --work-id example-work --verification '{"tests":"passed"}'
+python3 src/work_ledger.py complete --work-id example-work --note "Work completed"
+python3 src/work_ledger.py scan
+```
+
 The smoke test is:
 
 ```bash
