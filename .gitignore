@@ -1,0 +1,14 @@
+.DS_Store
+__pycache__/
+*.pyc
+.pytest_cache/
+state/
+tmp/
+.env
+.env.*
+*.secret
+openclaw.json
+auth-profiles.json
+auth-state.json
+models.json
+
