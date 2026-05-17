@@ -7,16 +7,17 @@ Most users do not run Ledger commands by hand. Install or wire it into your Open
 ## Flow
 
 ```mermaid
+%%{init: {"themeVariables": {"fontSize": "11px"}, "flowchart": {"nodeSpacing": 24, "rankSpacing": 28}} }%%
 flowchart TD
-  A[Start work entry] --> B[Record progress]
+  A[Start entry] --> B[Record progress]
   B --> C{Waiting?}
-  C -- yes --> D[Record wait reason]
-  C -- no --> E[Record verification]
+  C -- yes --> D[Record wait]
+  C -- no --> E[Record verify]
   D --> B
   E --> F{Complete?}
   F -- no --> B
-  F -- yes --> G[Send visible report]
-  G --> H[Record report_sent]
+  F -- yes --> G[Visible report]
+  G --> H[Mark reported]
   B --> I[Stale scan]
   I --> J[Recovery packet]
 ```
