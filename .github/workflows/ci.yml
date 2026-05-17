@@ -1,0 +1,18 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run smoke tests
+        run: |
+          python3 -m py_compile src/work_ledger.py tests/smoke/work_ledger_smoke.py
+          python3 tests/smoke/work_ledger_smoke.py
