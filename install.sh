@@ -27,7 +27,7 @@ with open(path, "wb") as handle:
 PY
 fi
 
-chmod +x "$INSTALL_PATH"
+chmod 755 "$INSTALL_PATH"
 
 cat <<MSG
 

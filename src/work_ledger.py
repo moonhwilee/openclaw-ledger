@@ -23,7 +23,16 @@ from typing import Any
 
 
 SCHEMA_VERSION = 1
-DEFAULT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def default_root() -> Path:
+    configured = os.environ.get("OPENCLAW_WORKSPACE")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".openclaw" / "workspace"
+
+
+DEFAULT_ROOT = default_root()
 ACTIVE_STATES = {"running", "waiting_subagent", "waiting_user", "verifying"}
 TERMINAL_STATES = {"reported", "abandoned"}
 WORK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")

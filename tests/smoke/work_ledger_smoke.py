@@ -76,7 +76,7 @@ def smoke_recovery_report_path() -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="work-ledger-smoke-") as tmp:
         root = Path(tmp)
         work_id = "smoke-ledger-wake-report"
-        visible_delivery = json.dumps({"channel": "telegram", "target": "test-user"})
+        visible_delivery = json.dumps({"channel": "chat", "target": "test-user"})
 
         run(
             root,
@@ -84,7 +84,7 @@ def smoke_recovery_report_path() -> dict[str, Any]:
             "--work-id",
             work_id,
             "--owner-session-key",
-            "agent:main:telegram:direct:test-user",
+            "agent:main:direct:test-user",
             "--visible-delivery",
             visible_delivery,
             "--request-summary",
@@ -109,7 +109,7 @@ def smoke_recovery_report_path() -> dict[str, Any]:
         packet = scan["recoveries"][0]
         assert_true(packet["reason"] == "completed_unreported", "unexpected recovery reason")
         assert_true(packet["work_id"] == work_id, "packet work_id mismatch")
-        assert_true(packet["visible_delivery"]["channel"] == "telegram", "visible delivery missing")
+        assert_true(packet["visible_delivery"]["channel"] == "chat", "visible delivery missing")
 
         run(
             root,
@@ -170,7 +170,7 @@ def smoke_report_sent_requires_delivery() -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="work-ledger-smoke-") as tmp:
         root = Path(tmp)
         work_id = "smoke-report-delivery-required"
-        visible_delivery = json.dumps({"channel": "telegram", "target": "test-user"})
+        visible_delivery = json.dumps({"channel": "chat", "target": "test-user"})
 
         run(
             root,
@@ -178,7 +178,7 @@ def smoke_report_sent_requires_delivery() -> dict[str, Any]:
             "--work-id",
             work_id,
             "--owner-session-key",
-            "agent:main:telegram:direct:test-user",
+            "agent:main:direct:test-user",
             "--visible-delivery",
             visible_delivery,
             "--request-summary",
@@ -234,9 +234,9 @@ def smoke_insufficient_recovery_context() -> dict[str, Any]:
             "--work-id",
             work_id,
             "--owner-session-key",
-            "agent:main:telegram:direct:test-user",
+            "agent:main:direct:test-user",
             "--visible-delivery",
-            json.dumps({"channel": "telegram", "target": "test-user"}),
+            json.dumps({"channel": "chat", "target": "test-user"}),
             "--request-summary",
             "Smoke test missing recovery context",
             "--expected-outputs",
@@ -279,9 +279,9 @@ def smoke_missing_expected_outputs_context() -> dict[str, Any]:
             "--work-id",
             work_id,
             "--owner-session-key",
-            "agent:main:telegram:direct:test-user",
+            "agent:main:direct:test-user",
             "--visible-delivery",
-            json.dumps({"channel": "telegram", "target": "test-user"}),
+            json.dumps({"channel": "chat", "target": "test-user"}),
             "--request-summary",
             "Smoke test missing expected outputs",
             "--next-recovery-action",
@@ -318,9 +318,9 @@ def smoke_per_entry_stale_after() -> dict[str, Any]:
             "--work-id",
             work_id,
             "--owner-session-key",
-            "agent:main:telegram:direct:test-user",
+            "agent:main:direct:test-user",
             "--visible-delivery",
-            json.dumps({"channel": "telegram", "target": "test-user"}),
+            json.dumps({"channel": "chat", "target": "test-user"}),
             "--request-summary",
             "Smoke test per-entry stale threshold",
             "--expected-outputs",
@@ -365,9 +365,9 @@ def smoke_waiting_user_minimum_stale_after() -> dict[str, Any]:
             "--work-id",
             work_id,
             "--owner-session-key",
-            "agent:main:telegram:direct:test-user",
+            "agent:main:direct:test-user",
             "--visible-delivery",
-            json.dumps({"channel": "telegram", "target": "test-user"}),
+            json.dumps({"channel": "chat", "target": "test-user"}),
             "--request-summary",
             "Smoke test waiting_user stale minimum",
             "--expected-outputs",
@@ -406,7 +406,7 @@ def smoke_gateway_side_effect_idempotency_policy() -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="work-ledger-smoke-") as tmp:
         root = Path(tmp)
         work_id = "smoke-gateway-side-effect-idempotency"
-        visible_delivery = json.dumps({"channel": "telegram", "target": "test-user"})
+        visible_delivery = json.dumps({"channel": "chat", "target": "test-user"})
 
         missing_idempotency = run_expect_fail(
             root,
@@ -414,7 +414,7 @@ def smoke_gateway_side_effect_idempotency_policy() -> dict[str, Any]:
             "--work-id",
             work_id,
             "--owner-session-key",
-            "agent:main:telegram:direct:test-user",
+            "agent:main:direct:test-user",
             "--visible-delivery",
             visible_delivery,
             "--request-summary",
@@ -442,7 +442,7 @@ def smoke_gateway_side_effect_idempotency_policy() -> dict[str, Any]:
             "--work-id",
             work_id,
             "--owner-session-key",
-            "agent:main:telegram:direct:test-user",
+            "agent:main:direct:test-user",
             "--visible-delivery",
             visible_delivery,
             "--request-summary",

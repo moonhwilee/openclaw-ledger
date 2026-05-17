@@ -2,9 +2,11 @@
 
 OpenClaw Ledger is a small recovery safety net for OpenClaw automation. It records progress, waits, verification, failures, and visible report delivery, then lets a watchdog detect unfinished work and wake the main session with a recovery packet.
 
-Why it exists: long-running agent work can be interrupted by a session stop, Gateway restart, model failure, network issue, or missed Telegram delivery. Without a ledger, recovery has to infer what happened from chat history and logs. That can lead to duplicate work, repeated side effects, or a task that finished internally but was never reported to the user.
+Why it exists: long-running agent work can be interrupted by a session stop, Gateway restart, model failure, network issue, or missed visible delivery. Without a ledger, recovery has to infer what happened from chat history and logs. That can lead to duplicate work, repeated side effects, or a task that finished internally but was never reported to the user.
 
 Most users do not run Ledger commands by hand. Install or wire it into your OpenClaw workflow, then let the orchestrator record work before side effects while a watchdog scans for stale or completed-but-unreported work. When recovery is needed, the watchdog wakes the main session so it can inspect the current state, continue safely, and send one visible completion report.
+
+Think of Ledger as a watchdog for unfinished work. It does not do the work itself; it watches the work records and wakes the main OpenClaw session when something needs recovery.
 
 ## When To Use It
 
@@ -34,6 +36,18 @@ Simple one-shot answers usually do not need Ledger.
 - Wakes the main session with recovery packets that contain enough context for safe reconciliation.
 - Requires visible completion reporting before work is marked reported.
 
+## Integration
+
+Ledger stores entries under the OpenClaw workspace by default. It uses `$OPENCLAW_WORKSPACE` when set, otherwise `~/.openclaw/workspace`.
+
+A typical integration has three parts:
+
+1. The orchestrator records the work before meaningful side effects.
+2. A watchdog periodically runs `openclaw-ledger scan`.
+3. If unfinished work is found, the watchdog wakes the main session with a recovery packet.
+
+Here, "main session" means the user-facing OpenClaw conversation that owns the work. "Visible report" means the final message the user actually receives, not just an internal tool result.
+
 ## How It Is Used
 
 Install the CLI:
@@ -54,9 +68,11 @@ Typical flow:
 For command details:
 
 ~~~bash
-openclaw-ledger --help
-openclaw-ledger scan
+~/.openclaw/bin/openclaw-ledger --help
+~/.openclaw/bin/openclaw-ledger scan
 ~~~
+
+If `~/.openclaw/bin` is on your PATH, the shorter `openclaw-ledger` command works too.
 
 ## Repository Layout
 
