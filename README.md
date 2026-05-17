@@ -20,24 +20,11 @@ Simple one-shot answers usually do not need Ledger.
 
 ## Flow
 
-```mermaid
-%%{init: {"themeVariables": {"fontSize": "11px"}, "flowchart": {"nodeSpacing": 22, "rankSpacing": 26}} }%%
-flowchart TD
-  subgraph R[Record]
-    direction LR
-    A[Start] --> B[Progress] --> C[Wait / verify]
-  end
-  subgraph D[Detect]
-    direction LR
-    E[Watchdog scan] --> F[Recovery packet]
-  end
-  subgraph C2[Recover]
-    direction LR
-    G[Wake main session] --> H[Reconcile state] --> I[Visible report] --> J[Mark reported]
-  end
-  C --> E
-  F --> G
-```
+| Stage | What Happens |
+|---|---|
+| **1. Record** | Start work entry -> record progress -> record wait or verification |
+| **2. Detect** | Watchdog scan -> find stale or completed-but-unreported work -> create recovery packet |
+| **3. Recover** | Wake main session -> reconcile state -> send visible report -> mark reported |
 
 ## What It Does
 
