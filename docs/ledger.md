@@ -12,7 +12,7 @@ Work Ledger exists to answer:
 - What is the next safe recovery action?
 - Was the user already sent a visible completion report?
 
-It does not perform project-specific completion judgment. For example, it does not decide whether a GoalFlow goal is complete.
+It does not perform project-specific completion judgment. It records recovery state; the caller decides whether the original task is actually complete.
 
 ## Core Concepts
 
@@ -46,7 +46,7 @@ On recovery, the main session should:
 
 ## Boundaries
 
-Work Ledger is independent from GoalFlow. It can recover any long-running work, not only goals.
+Work Ledger is project-agnostic. It can recover any long-running work when the caller records enough context.
 
 It should not:
 
