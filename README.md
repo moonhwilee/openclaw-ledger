@@ -43,7 +43,7 @@ Ledger stores entries under the OpenClaw workspace by default. It uses `$OPENCLA
 A typical integration has three parts:
 
 1. The orchestrator records the work before meaningful side effects.
-2. A watchdog periodically runs `openclaw-ledger scan`.
+2. A watchdog periodically runs `~/.openclaw/bin/openclaw-ledger scan`.
 3. If unfinished work is found, the watchdog wakes the main session with a recovery packet.
 
 Here, "main session" means the user-facing OpenClaw conversation that owns the work. "Visible report" means the final message the user actually receives, not just an internal tool result.
