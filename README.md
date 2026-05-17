@@ -33,6 +33,12 @@ flowchart TD
 
 Ledger is usually called by automation, not by the end user directly.
 
+Install the CLI:
+
+~~~bash
+curl -fsSL https://raw.githubusercontent.com/moonhwilee/openclaw-ledger/main/install.sh | bash
+~~~
+
 Typical flow:
 
 1. A long-running task starts.
