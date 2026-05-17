@@ -1,6 +1,6 @@
 # Work Ledger
 
-Work Ledger is a small recovery system for long-running OpenClaw work. It records enough state for the main session to recover safely after interruption, stale execution, or a missed completion report.
+Work Ledger is a small recovery system for long-running OpenClaw work. It records enough state for a watchdog to detect stale or completed-but-unreported work, wake the main session, and let that session recover safely after interruption or a missed completion report.
 
 ## Purpose
 
@@ -11,6 +11,7 @@ Work Ledger exists to answer:
 - What artifacts should exist?
 - What is the next safe recovery action?
 - Was the user already sent a visible completion report?
+- Should the watchdog wake the main session for recovery?
 
 It does not perform project-specific completion judgment. It records recovery state; the caller decides whether the original task is actually complete.
 
@@ -18,7 +19,8 @@ It does not perform project-specific completion judgment. It records recovery st
 
 - **Work entry**: one durable record for a long-running task.
 - **Events**: append-only progress, wait, verification, failure, completion, and report-sent records.
-- **Recovery packet**: a compact instruction bundle for the main session after stale or unreported work is detected.
+- **Watchdog scan**: a periodic check for stale, interrupted, or completed-but-unreported work.
+- **Recovery packet**: a compact instruction bundle used to wake and guide the main session after stale or unreported work is detected.
 - **Visible report**: the final user-facing completion report.
 - **Idempotency context**: information used to avoid repeating unsafe side effects.
 
@@ -29,12 +31,13 @@ It does not perform project-specific completion judgment. It records recovery st
 3. Record waits when blocked on subagents, user input, or external systems.
 4. Record verification when checks are running or complete.
 5. Mark the work complete only after the requested outcome is handled.
-6. Send a visible completion report.
-7. Record `report_sent`.
+6. If work becomes stale or completed-but-unreported, the watchdog wakes the main session with a recovery packet.
+7. Send a visible completion report.
+8. Record `report_sent`.
 
 ## Recovery Behavior
 
-On recovery, the main session should:
+On watchdog recovery, the main session should:
 
 1. Read the ledger entry and latest events.
 2. Inspect current artifacts, tasks, and subagents.
