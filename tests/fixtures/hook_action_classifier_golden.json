@@ -1,0 +1,569 @@
+{
+  "schema_version": "hook.action_classifier.golden.v0.1",
+  "description": "Compressed representative target/runtime cases for coarse hook action classification and the current Phase 2 guardrail boundary. These are deterministic regression contracts, not LLM-evaluated examples.",
+  "action_classes": [
+    "read_only",
+    "local_files",
+    "repo_changes",
+    "external_message",
+    "public_post",
+    "destructive",
+    "gateway_runtime"
+  ],
+  "cases": [
+    {
+      "id": "read_only_search_mentions_git_push",
+      "payload": {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "exec_command",
+        "tool_input": {
+          "cmd": "rg \"git push\" docs tests"
+        }
+      },
+      "state": {
+        "side_effect_status": "unknown"
+      },
+      "action_class": "read_only",
+      "confidence": "high",
+      "is_non_idempotent": false,
+      "requires_user_approval_candidate": false,
+      "ledger_target_decision": "allow",
+      "goalflow_target_decision": "allow",
+      "rationale": "Searching for unsafe text is still inspection, not execution.",
+      "runtime_parity": true,
+      "classifier_approval_sensitive_candidate": false
+    },
+    {
+      "id": "permission_request_without_actionable_details",
+      "payload": {
+        "hook_event_name": "PermissionRequest",
+        "tool_name": "exec_command",
+        "tool_input": {
+          "justification": "Need permission, but no command payload was supplied.",
+          "sandbox_permissions": "require_escalated"
+        },
+        "message": "Agent requests permission, but no executable command/source/argv payload was supplied."
+      },
+      "state": {
+        "side_effect_status": "unknown"
+      },
+      "action_class": "gateway_runtime",
+      "confidence": "low",
+      "is_non_idempotent": true,
+      "requires_user_approval_candidate": true,
+      "ledger_target_decision": "block",
+      "goalflow_target_decision": "block",
+      "rationale": "A permission request with only metadata is still too ambiguous to treat as read-only.",
+      "runtime_parity": true,
+      "classifier_approval_sensitive_candidate": true,
+      "classifier_current_guardrail_unsafe_candidate": false
+    },
+    {
+      "id": "local_file_patch",
+      "payload": {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "apply_patch",
+        "tool_input": "*** Begin Patch\n*** Update File: docs/example.md\n@@\n-old\n+new\n*** End Patch"
+      },
+      "state": {
+        "side_effect_class": "local_files"
+      },
+      "action_class": "local_files",
+      "confidence": "high",
+      "is_non_idempotent": true,
+      "requires_user_approval_candidate": false,
+      "ledger_target_decision": "allow",
+      "goalflow_target_decision": "allow",
+      "rationale": "Local edits are durable but not external publication.",
+      "runtime_parity": true,
+      "classifier_approval_sensitive_candidate": false
+    },
+    {
+      "id": "repo_git_push",
+      "payload": {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "exec_command",
+        "tool_input": {
+          "cmd": "git push origin main"
+        }
+      },
+      "state": {
+        "side_effect_status": "unknown"
+      },
+      "action_class": "repo_changes",
+      "confidence": "high",
+      "is_non_idempotent": true,
+      "requires_user_approval_candidate": true,
+      "ledger_target_decision": "block",
+      "goalflow_target_decision": "block",
+      "rationale": "Remote git writes need durable clearance before retry or execution.",
+      "runtime_parity": true,
+      "classifier_approval_sensitive_candidate": true
+    },
+    {
+      "id": "repo_openclaw_command_git_push",
+      "payload": {
+        "type": "command",
+        "action": "PreToolUse",
+        "command": "git push origin main"
+      },
+      "state": {
+        "side_effect_status": "unknown"
+      },
+      "action_class": "repo_changes",
+      "confidence": "high",
+      "is_non_idempotent": true,
+      "requires_user_approval_candidate": true,
+      "ledger_target_decision": "block",
+      "goalflow_target_decision": "block",
+      "rationale": "OpenClaw-native command hooks can carry the same remote git write without Codex hook_event_name/tool_input shape.",
+      "runtime_parity": true,
+      "classifier_approval_sensitive_candidate": true
+    },
+    {
+      "id": "repo_github_write_tool",
+      "payload": {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "mcp__codex_apps__github_update_file",
+        "tool_input": {
+          "repository_full_name": "owner/repo",
+          "path": "README.md"
+        }
+      },
+      "state": {
+        "side_effect_status": "unknown"
+      },
+      "action_class": "repo_changes",
+      "confidence": "high",
+      "is_non_idempotent": true,
+      "requires_user_approval_candidate": true,
+      "ledger_target_decision": "block",
+      "goalflow_target_decision": "block",
+      "rationale": "GitHub write tools are repository mutations independent of shell syntax.",
+      "runtime_parity": true,
+      "classifier_approval_sensitive_candidate": true
+    },
+    {
+      "id": "repo_shell_wrapped_git_push",
+      "payload": {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "exec_command",
+        "tool_input": {
+          "cmd": "zsh -lc 'git push origin main'"
+        }
+      },
+      "state": {
+        "side_effect_status": "unknown"
+      },
+      "action_class": "repo_changes",
+      "confidence": "high",
+      "is_non_idempotent": true,
+      "requires_user_approval_candidate": true,
+      "ledger_target_decision": "block",
+      "goalflow_target_decision": "block",
+      "rationale": "Shell-wrapped remote git writes are still repository mutations.",
+      "runtime_parity": true,
+      "classifier_approval_sensitive_candidate": true
+    },
+    {
+      "id": "external_private_message",
+      "payload": {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "message",
+        "tool_input": {
+          "action": "send",
+          "channel": "telegram",
+          "target": "telegram:external-recipient",
+          "message": "Please review this external note"
+        }
+      },
+      "state": {
+        "side_effect_status": "unknown"
+      },
+      "action_class": "external_message",
+      "confidence": "high",
+      "is_non_idempotent": true,
+      "requires_user_approval_candidate": true,
+      "ledger_target_decision": "block",
+      "goalflow_target_decision": "block",
+      "rationale": "Third-party outbound messages are external side effects and should require approval.",
+      "runtime_parity": true,
+      "delivery_scope": "third_party_outbound",
+      "classifier_approval_sensitive_candidate": true
+    },
+    {
+      "id": "external_email_gog_gmail_send_cli_command",
+      "payload": {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "exec_command",
+        "tool_input": {
+          "cmd": "gog gmail send --to user@example.com --subject hi --text hello"
+        }
+      },
+      "state": {
+        "side_effect_status": "unknown"
+      },
+      "action_class": "external_message",
+      "confidence": "high",
+      "is_non_idempotent": true,
+      "requires_user_approval_candidate": true,
+      "classifier_approval_sensitive_candidate": true,
+      "classifier_current_guardrail_unsafe_candidate": true,
+      "ledger_target_decision": "block",
+      "goalflow_target_decision": "block",
+      "rationale": "Direct gog gmail send is an external-message boundary; final policy marks it both current-unsafe and approval-sensitive so consumers block without durable clearance.",
+      "runtime_parity": true
+    },
+    {
+      "id": "ledger_required_completion_report",
+      "payload": {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "message",
+        "tool_input": {
+          "action": "send",
+          "channel": "telegram",
+          "target": "test-user",
+          "message": "Status: 완료"
+        },
+        "sessionKey": "agent:main:telegram:direct:test-user"
+      },
+      "state": {
+        "status": "completed_unreported",
+        "completion_report_sent": false,
+        "owner_session_key": "agent:main:telegram:direct:test-user",
+        "visible_delivery": {
+          "channel": "telegram",
+          "target": "test-user"
+        }
+      },
+      "action_class": "external_message",
+      "confidence": "high",
+      "is_non_idempotent": true,
+      "requires_user_approval_candidate": false,
+      "ledger_target_decision": "allow",
+      "goalflow_target_decision": "allow",
+      "rationale": "Ledger must allow its required visible completion report on the expected route; GoalFlow does not own report proof.",
+      "runtime_parity": true,
+      "delivery_scope": "owner_visible_delivery",
+      "classifier_approval_sensitive_candidate": true
+    },
+    {
+      "id": "ledger_required_native_message_send_completion_report",
+      "payload": {
+        "type": "message",
+        "action": "send",
+        "channel": "telegram",
+        "target": "test-user",
+        "message": "Status: 완료",
+        "sessionKey": "agent:main:telegram:direct:test-user"
+      },
+      "state": {
+        "status": "completed_unreported",
+        "completion_report_sent": false,
+        "owner_session_key": "agent:main:telegram:direct:test-user",
+        "visible_delivery": {
+          "channel": "telegram",
+          "target": "test-user"
+        }
+      },
+      "action_class": "external_message",
+      "confidence": "high",
+      "is_non_idempotent": true,
+      "requires_user_approval_candidate": false,
+      "ledger_target_decision": "allow",
+      "goalflow_target_decision": "allow",
+      "rationale": "OpenClaw-native message:send can be the required visible completion report when it has exact owner/session and route binding.",
+      "runtime_parity": true,
+      "delivery_scope": "owner_visible_delivery",
+      "classifier_approval_sensitive_candidate": true
+    },
+    {
+      "id": "ledger_completion_report_owner_missing",
+      "payload": {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "message",
+        "tool_input": {
+          "action": "send",
+          "channel": "telegram",
+          "target": "test-user",
+          "message": "Status: 완료"
+        },
+        "sessionKey": "agent:main:telegram:direct:test-user"
+      },
+      "state": {
+        "status": "completed_unreported",
+        "completion_report_sent": false,
+        "visible_delivery": {
+          "channel": "telegram",
+          "target": "test-user"
+        }
+      },
+      "action_class": "external_message",
+      "confidence": "high",
+      "is_non_idempotent": true,
+      "requires_user_approval_candidate": true,
+      "requires_explicit_visible_route": true,
+      "ledger_target_decision": "block",
+      "goalflow_target_decision": "block",
+      "rationale": "A completion-report send must be bound to the ledger owner session, not only the visible route.",
+      "runtime_parity": true,
+      "delivery_scope": "owner_visible_delivery",
+      "classifier_approval_sensitive_candidate": true
+    },
+    {
+      "id": "ledger_completion_report_unexpected_route_extra",
+      "payload": {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "message",
+        "tool_input": {
+          "action": "send",
+          "channel": "telegram",
+          "target": "test-user",
+          "threadId": "thread-1",
+          "message": "Status: 완료"
+        },
+        "sessionKey": "agent:main:telegram:direct:test-user"
+      },
+      "state": {
+        "status": "completed_unreported",
+        "completion_report_sent": false,
+        "owner_session_key": "agent:main:telegram:direct:test-user",
+        "visible_delivery": {
+          "channel": "telegram",
+          "target": "test-user"
+        }
+      },
+      "action_class": "external_message",
+      "confidence": "high",
+      "is_non_idempotent": true,
+      "requires_user_approval_candidate": true,
+      "requires_explicit_visible_route": true,
+      "ledger_target_decision": "block",
+      "goalflow_target_decision": "block",
+      "rationale": "Completion-report route matching rejects unexpected route extras as well as missing expected extras.",
+      "runtime_parity": true,
+      "delivery_scope": "owner_visible_delivery",
+      "classifier_approval_sensitive_candidate": true
+    },
+    {
+      "id": "ledger_completion_report_wrong_route",
+      "payload": {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "message",
+        "tool_input": {
+          "action": "send",
+          "channel": "telegram",
+          "target": "999999",
+          "message": "Status: 완료"
+        },
+        "sessionKey": "agent:main:telegram:direct:test-user"
+      },
+      "state": {
+        "status": "completed_unreported",
+        "completion_report_sent": false,
+        "owner_session_key": "agent:main:telegram:direct:test-user",
+        "visible_delivery": {
+          "channel": "telegram",
+          "target": "test-user"
+        }
+      },
+      "action_class": "external_message",
+      "confidence": "high",
+      "is_non_idempotent": true,
+      "requires_user_approval_candidate": true,
+      "ledger_target_decision": "block",
+      "goalflow_target_decision": "block",
+      "rationale": "Ledger's completion-report exception is bound to the expected route and must not allow a wrong Telegram target.",
+      "runtime_parity": true,
+      "delivery_scope": "owner_visible_delivery",
+      "classifier_approval_sensitive_candidate": true
+    },
+    {
+      "id": "ledger_visible_report_proof_message_sent",
+      "payload": {
+        "type": "message",
+        "action": "sent",
+        "channel": "telegram",
+        "target": "test-user",
+        "messageId": "visible-report-1"
+      },
+      "state": {
+        "status": "completed_unreported",
+        "visible_delivery": {
+          "channel": "telegram",
+          "target": "test-user"
+        }
+      },
+      "action_class": "external_message",
+      "confidence": "high",
+      "delivery_scope": "owner_visible_delivery",
+      "runtime_parity": true,
+      "is_non_idempotent": false,
+      "requires_user_approval_candidate": false,
+      "ledger_target_decision": "allow",
+      "goalflow_target_decision": "allow",
+      "ledger_report_proof_target": "record",
+      "rationale": "A delivered-message observation is proof telemetry, not a new outbound attempt. Ledger/orchestrator owns report-sent recording.",
+      "classifier_approval_sensitive_candidate": false
+    },
+    {
+      "id": "ledger_visible_report_proof_wrong_route",
+      "payload": {
+        "type": "message",
+        "action": "sent",
+        "channel": "telegram",
+        "target": "999999",
+        "delivery_message_id": "visible-report-wrong-route"
+      },
+      "state": {
+        "status": "completed_unreported",
+        "visible_delivery": {
+          "channel": "telegram",
+          "target": "test-user"
+        }
+      },
+      "action_class": "external_message",
+      "confidence": "high",
+      "delivery_scope": "owner_visible_delivery",
+      "runtime_parity": true,
+      "is_non_idempotent": false,
+      "requires_user_approval_candidate": false,
+      "ledger_target_decision": "allow",
+      "goalflow_target_decision": "allow",
+      "ledger_report_proof_target": "ignore",
+      "rationale": "Wrong-route delivered-message telemetry is still only an observation, but Ledger must not treat it as completion report proof.",
+      "classifier_approval_sensitive_candidate": false
+    },
+    {
+      "id": "stop_completed_unreported_nudge",
+      "payload": {
+        "hook_event_name": "Stop",
+        "last_assistant_message": "Done"
+      },
+      "state": {
+        "status": "completed_unreported",
+        "completion_report_sent": false
+      },
+      "action_class": "read_only",
+      "confidence": "medium",
+      "runtime_parity": true,
+      "is_non_idempotent": false,
+      "requires_user_approval_candidate": false,
+      "ledger_target_decision": "nudge",
+      "goalflow_target_decision": "allow",
+      "rationale": "Stop is a control/telemetry boundary; Ledger nudges only because terminal work still lacks a visible report.",
+      "classifier_approval_sensitive_candidate": false
+    },
+    {
+      "id": "repo_git_push_with_goalflow_clearance",
+      "payload": {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "exec_command",
+        "tool_input": {
+          "cmd": "git push origin main"
+        }
+      },
+      "state": {
+        "approval_clearance": true
+      },
+      "action_class": "repo_changes",
+      "confidence": "high",
+      "runtime_parity": true,
+      "is_non_idempotent": true,
+      "requires_user_approval_candidate": true,
+      "ledger_target_decision": "block",
+      "goalflow_target_decision": "block",
+      "rationale": "A broad GoalFlow clearance boolean is not enough without exact hook-to-approval binding for this side-effect boundary.",
+      "classifier_approval_sensitive_candidate": true
+    },
+    {
+      "id": "post_tool_git_push_observation",
+      "payload": {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "exec_command",
+        "tool_input": {
+          "cmd": "git push origin main"
+        },
+        "tool_response": {
+          "exit_code": 0
+        }
+      },
+      "state": {},
+      "action_class": "repo_changes",
+      "confidence": "high",
+      "is_non_idempotent": false,
+      "requires_user_approval_candidate": false,
+      "classifier_approval_sensitive_candidate": false,
+      "ledger_target_decision": "allow",
+      "goalflow_target_decision": "allow",
+      "rationale": "PostToolUse is evidence after execution; it may observe a non-idempotent action without being an approval-sensitive attempt.",
+      "runtime_parity": true
+    },
+    {
+      "id": "destructive_rm_recursive_force",
+      "payload": {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "exec_command",
+        "tool_input": {
+          "cmd": "rm -fr /tmp/openclaw-test"
+        }
+      },
+      "state": {
+        "side_effect_status": "unknown"
+      },
+      "action_class": "destructive",
+      "confidence": "high",
+      "is_non_idempotent": true,
+      "requires_user_approval_candidate": true,
+      "ledger_target_decision": "block",
+      "goalflow_target_decision": "block",
+      "rationale": "Recursive force deletion is destructive and must not be retried blindly.",
+      "runtime_parity": true,
+      "classifier_approval_sensitive_candidate": true
+    },
+    {
+      "id": "gateway_kickstart",
+      "payload": {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "exec_command",
+        "tool_input": {
+          "cmd": "launchctl kickstart -k gui/$UID/ai.openclaw.gateway"
+        }
+      },
+      "state": {
+        "side_effect_status": "unknown"
+      },
+      "action_class": "gateway_runtime",
+      "confidence": "high",
+      "is_non_idempotent": true,
+      "requires_user_approval_candidate": true,
+      "ledger_target_decision": "block",
+      "goalflow_target_decision": "block",
+      "rationale": "Gateway restarts affect runtime availability and need explicit clearance.",
+      "runtime_parity": true,
+      "classifier_approval_sensitive_candidate": true
+    },
+    {
+      "id": "public_post_xurl_cli_command",
+      "payload": {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "exec_command",
+        "tool_input": {
+          "cmd": "xurl post --text 'public update'"
+        }
+      },
+      "state": {
+        "side_effect_status": "unknown"
+      },
+      "action_class": "public_post",
+      "confidence": "high",
+      "is_non_idempotent": true,
+      "requires_user_approval_candidate": true,
+      "ledger_target_decision": "block",
+      "goalflow_target_decision": "block",
+      "rationale": "A command-shaped X post is a public publication boundary and should be classified like the structured xurl tool.",
+      "runtime_parity": true,
+      "classifier_approval_sensitive_candidate": true
+    }
+  ]
+}
