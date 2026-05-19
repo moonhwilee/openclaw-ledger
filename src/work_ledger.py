@@ -711,6 +711,7 @@ def recovery_context_gaps(state: dict[str, Any]) -> list[str]:
         bool(state.get("artifact_paths"))
         or bool(state.get("openclaw_task_ids"))
         or bool(state.get("subagent_session_keys"))
+        or bool(state.get("subagents"))
         or bool(state.get("no_artifact_expected"))
     )
     if not has_recovery_anchor:
@@ -927,11 +928,143 @@ def collect_active_task_refs(root: Path) -> set[str]:
         for subagent in state.get("subagents", []):
             if not isinstance(subagent, dict):
                 continue
-            for key in ("taskId", "runId", "sessionKey", "childSessionKey", "agent_id", "agentId"):
+            for key in ("id", "taskId", "runId", "sessionKey", "childSessionKey", "agent_id", "agentId"):
                 value = subagent.get(key)
                 if isinstance(value, str) and value:
                     refs.update(normalized_task_identity_values(value))
     return refs
+
+
+def collect_active_task_ref_details(root: Path) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for state in load_states(root):
+        if state.get("status") not in ACTIVE_STATES:
+            continue
+        for key in ("openclaw_task_ids", "subagent_session_keys"):
+            for value in state.get(key, []):
+                if not isinstance(value, str) or not value:
+                    continue
+                for normalized in normalized_task_identity_values(value):
+                    marker = (str(state.get("work_id") or ""), normalized)
+                    if marker in seen:
+                        continue
+                    seen.add(marker)
+                    refs.append({"work_id": state.get("work_id"), "status": state.get("status"), "ref": normalized, "raw_ref": value, "source": key})
+        for subagent in state.get("subagents", []):
+            if not isinstance(subagent, dict):
+                continue
+            for key in ("id", "taskId", "runId", "sessionKey", "childSessionKey", "agent_id", "agentId"):
+                value = subagent.get(key)
+                if not isinstance(value, str) or not value:
+                    continue
+                for normalized in normalized_task_identity_values(value):
+                    marker = (str(state.get("work_id") or ""), normalized)
+                    if marker in seen:
+                        continue
+                    seen.add(marker)
+                    refs.append({
+                        "work_id": state.get("work_id"),
+                        "status": state.get("status"),
+                        "ref": normalized,
+                        "raw_ref": value,
+                        "source": f"subagents.{key}",
+                        "subagent": {k: v for k, v in subagent.items() if k in {"id", "role", "taskId", "runId", "sessionKey", "childSessionKey", "agent_id", "agentId"}},
+                    })
+    return refs
+
+
+def load_openclaw_task_lookup(lookup: str) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        proc = subprocess.run(
+            ["openclaw", "tasks", "show", "--json", lookup],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, str(exc)
+    if proc.returncode != 0:
+        text = (proc.stderr or proc.stdout or f"openclaw tasks show exited {proc.returncode}").strip()
+        lowered = text.lower()
+        if "not found" in lowered or "no task" in lowered:
+            return {"status": "notFound", "lookup": lookup}, None
+        return None, text
+    output = proc.stdout.strip() or proc.stderr.strip()
+    try:
+        parsed = json.loads(output)
+    except json.JSONDecodeError as exc:
+        return None, f"invalid task JSON for {lookup}: {exc}"
+    if isinstance(parsed, dict) and isinstance(parsed.get("task"), dict):
+        return parsed["task"], None
+    if isinstance(parsed, dict):
+        return parsed, None
+    return None, f"unexpected task JSON for {lookup}"
+
+
+def normalized_openclaw_task_status(task: dict[str, Any]) -> str | None:
+    status = task.get("status")
+    if isinstance(status, str):
+        return status
+    if isinstance(status, dict):
+        for key in ("completed", "errored"):
+            if key in status:
+                return key
+    return None
+
+
+def find_referenced_terminal_tasks(root: Path) -> dict[str, Any]:
+    terminal_statuses = {
+        "succeeded",
+        "failed",
+        "timed_out",
+        "cancelled",
+        "lost",
+        "shutdown",
+        "notFound",
+        "not_found",
+        "completed",
+        "errored",
+    }
+    terminal_refs: list[dict[str, Any]] = []
+    errors: list[str] = []
+    checked: set[str] = set()
+    for ref in collect_active_task_ref_details(root):
+        lookup = ref.get("ref")
+        if not isinstance(lookup, str) or not lookup or lookup in checked:
+            continue
+        raw_ref = ref.get("raw_ref")
+        if lookup.startswith("codex-thread:") or (isinstance(raw_ref, str) and raw_ref.startswith("codex-thread:")):
+            continue
+        checked.add(lookup)
+        task, error = load_openclaw_task_lookup(lookup)
+        if error:
+            errors.append(f"{lookup}: {error}")
+            continue
+        if not task:
+            continue
+        status = normalized_openclaw_task_status(task)
+        if status in terminal_statuses:
+            terminal_refs.append({
+                **ref,
+                "taskId": task.get("taskId"),
+                "runId": task.get("runId"),
+                "runtime": task.get("runtime"),
+                "task_status": status,
+                "label": task.get("label"),
+                "terminalSummary": task.get("terminalSummary"),
+                "terminalOutcome": task.get("terminalOutcome"),
+                "endedAt": task.get("endedAt"),
+            })
+    return {
+        "ok": not errors,
+        "has_terminal_refs": bool(terminal_refs),
+        "terminal_refs": terminal_refs,
+        "errors": errors,
+        "checked_refs": len(checked),
+        "policy": "terminal referenced tasks require LLM reconciliation only; do not restart or repeat side effects from this signal alone",
+    }
 
 
 def load_openclaw_tasks(status: str) -> tuple[list[dict[str, Any]], str | None]:
@@ -1097,6 +1230,90 @@ def find_orphan_active_work(root: Path, *, include_cron: bool = False, min_age_s
         "errors": errors,
         "min_age_seconds": min_age_seconds,
         "policy": "refresh_before_user_message; ignores fresh tasks by default; handled orphans are durably suppressed; visible warnings require delivery proof and suppress repeats for 24h; do not auto-create ledger entries or recover from this output alone",
+    }
+
+
+def watchdog_check(
+    root: Path,
+    *,
+    include_cron: bool = False,
+    min_age_seconds: int = DEFAULT_ORPHAN_MIN_AGE_SECONDS,
+    cooldown_seconds: int = 30 * 60,
+) -> dict[str, Any]:
+    recoveries = scan_recoveries(root, cooldown_seconds)
+    if recoveries:
+        return {
+            "ok": True,
+            "status": "needs_wake",
+            "needs_wake": True,
+            "wake_reason": "recovery",
+            "recoveries": recoveries,
+            "orphans": None,
+            "policy": "LLM must reconcile recovery packet before visible report; do not retry risky side effects from watchdog output alone",
+        }
+
+    terminal_refs = find_referenced_terminal_tasks(root)
+    if not terminal_refs.get("ok", False):
+        return {
+            "ok": False,
+            "status": "error",
+            "needs_wake": True,
+            "wake_reason": "runner_error",
+            "recoveries": [],
+            "terminal_refs": terminal_refs,
+            "orphans": None,
+            "errors": terminal_refs.get("errors", []),
+            "policy": "LLM should inspect runner errors before user-visible output; do not retry risky side effects",
+        }
+    if terminal_refs.get("has_terminal_refs"):
+        return {
+            "ok": True,
+            "status": "needs_wake",
+            "needs_wake": True,
+            "wake_reason": "referenced_task_reconciliation",
+            "recoveries": [],
+            "terminal_refs": terminal_refs,
+            "orphans": None,
+            "policy": "LLM must reconcile referenced terminal tasks by integrating results or reporting failure; do not restart or repeat side effects from this signal alone",
+        }
+
+    orphan_result = find_orphan_active_work(root, include_cron=include_cron, min_age_seconds=min_age_seconds)
+    if not orphan_result.get("ok", False):
+        return {
+            "ok": False,
+            "status": "error",
+            "needs_wake": True,
+            "wake_reason": "runner_error",
+            "recoveries": [],
+            "orphans": orphan_result,
+            "errors": orphan_result.get("errors", []),
+            "policy": "LLM should inspect runner errors before user-visible output; do not retry risky side effects",
+        }
+    if orphan_result.get("has_orphans"):
+        return {
+            "ok": True,
+            "status": "needs_wake",
+            "needs_wake": True,
+            "wake_reason": "orphan_reconciliation",
+            "recoveries": [],
+            "orphans": orphan_result,
+            "policy": "LLM must refresh/reconcile orphans before any user-visible warning; at most one aggregated result message",
+        }
+    handled_orphans = [
+        item
+        for item in orphan_result.get("ignored", [])
+        if isinstance(item, dict) and item.get("reason") == "handled"
+    ]
+    return {
+        "ok": True,
+        "status": "clean",
+        "needs_wake": False,
+        "wake_reason": None,
+        "recoveries": [],
+        "terminal_refs": terminal_refs,
+        "orphans": orphan_result,
+        "handled_orphans": handled_orphans,
+        "policy": "clean/no-op path; no visible user message needed",
     }
 
 
@@ -1436,6 +1653,11 @@ def build_parser() -> argparse.ArgumentParser:
     orphans.add_argument("--include-cron", action="store_true", help="Include cron tasks in orphan reconciliation")
     orphans.add_argument("--min-age-seconds", type=int, default=DEFAULT_ORPHAN_MIN_AGE_SECONDS, help="Only report active tasks at least this old; use 0 for all")
 
+    watchdog = sub.add_parser("watchdog-check", help="Fast deterministic watchdog triage; clean exits need no LLM")
+    watchdog.add_argument("--include-cron", action="store_true", help="Include cron tasks in orphan reconciliation")
+    watchdog.add_argument("--min-age-seconds", type=int, default=DEFAULT_ORPHAN_MIN_AGE_SECONDS, help="Only report active tasks at least this old; use 0 for all")
+    watchdog.add_argument("--cooldown-seconds", type=int, default=30 * 60, help="Recovery packet cooldown")
+
     orphan_warning = sub.add_parser("orphan-warning-sent", help="Suppress repeat warnings for a reported orphan fingerprint")
     orphan_warning.add_argument("--orphan-fingerprint", required=True)
     orphan_warning.add_argument("--orphan-fingerprints", help="JSON array of equivalent orphan fingerprints to suppress together")
@@ -1494,6 +1716,11 @@ def main() -> int:
     if args.command == "orphans":
         min_age_seconds = validate_positive_int(args.min_age_seconds, "--min-age-seconds") if args.min_age_seconds else 0
         print(json.dumps(find_orphan_active_work(root, include_cron=args.include_cron, min_age_seconds=min_age_seconds), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.command == "watchdog-check":
+        min_age_seconds = validate_positive_int(args.min_age_seconds, "--min-age-seconds") if args.min_age_seconds else 0
+        cooldown_seconds = validate_positive_int(args.cooldown_seconds, "--cooldown-seconds") if args.cooldown_seconds else 0
+        print(json.dumps(watchdog_check(root, include_cron=args.include_cron, min_age_seconds=min_age_seconds, cooldown_seconds=cooldown_seconds), ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     if args.command == "orphan-warning-sent":
         item = record_orphan_warning(

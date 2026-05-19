@@ -193,8 +193,32 @@ The output is not a request to immediately warn the user:
   remain user-relevant
 - keep the default age threshold unless you are explicitly debugging fresh
   tasks; tool use alone still does not justify a ledger entry
-- keep this check inside the existing watchdog; do not add a separate daemon
-  unless the current watchdog becomes too expensive or unreliable
+- run the clean path outside the LLM; the 10-minute check should be a
+  deterministic local runner that wakes the main session only for non-clean
+  results
+
+## Watchdog Check Contract
+
+`openclaw-ledger watchdog-check --include-cron` is the deterministic watchdog
+triage contract. The LaunchAgent runner executes it every 10 minutes. It runs
+recovery scan, referenced task terminal-state reconciliation, and orphan
+reconciliation input gathering, then returns one of:
+
+- `clean`: no LLM/user-visible work is needed.
+- `needs_wake` with `wake_reason=recovery`: process recovery packets, verify,
+  send one visible completion report, then record `report-sent`.
+- `needs_wake` with `wake_reason=referenced_task_reconciliation`: inspect
+  ledger-referenced terminal tasks/subagents, integrate their result or report
+  failure, and do not restart or repeat side effects from this signal alone.
+- `needs_wake` with `wake_reason=orphan_reconciliation`: refresh/reconcile
+  orphan state before any warning, then either record `orphan-handled` silently
+  or send one aggregated result and record `orphan-warning-sent`.
+- `error`: inspect runner errors before deciding whether a visible message is
+  warranted.
+
+The check is intentionally not a recovery engine. It must not restart work,
+repeat risky side effects, or send user-visible messages from scan/orphan output
+alone. The clean result must not wake the main session.
 
 ## Boundaries
 
