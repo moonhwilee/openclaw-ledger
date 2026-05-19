@@ -92,6 +92,30 @@ python3 tests/smoke/hook_event_contract_smoke.py
 python3 tests/smoke/hook_action_classifier_golden_smoke.py
 ~~~
 
+## Maintainer Workflow
+
+Use this repository as the source of truth for Ledger changes.
+
+~~~bash
+# edit and test inside this repo
+python3 tests/smoke/work_ledger_smoke.py
+python3 tests/smoke/work_ledger_hook_smoke.py
+python3 tests/smoke/hook_event_contract_smoke.py
+python3 tests/smoke/hook_action_classifier_golden_smoke.py
+
+# deploy the verified repo version to the local OpenClaw server
+scripts/deploy-local.sh
+
+# publish with the normal GitHub flow
+git checkout -b codex/my-ledger-change
+git add .
+git commit -m "Describe Ledger change"
+git push -u origin HEAD
+gh pr create --draft --base main --head "$(git branch --show-current)"
+~~~
+
+Do not edit the local installed files under `~/.openclaw/bin` as the source of truth. They are deploy outputs from this repository.
+
 ## License
 
 MIT
