@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -21,20 +22,38 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from hook_event_contract import ledger_guardrail, ledger_observation
+
 
 SCHEMA_VERSION = 1
-
-
-def default_root() -> Path:
-    configured = os.environ.get("OPENCLAW_WORKSPACE")
-    if configured:
-        return Path(configured).expanduser()
-    return Path.home() / ".openclaw" / "workspace"
-
-
-DEFAULT_ROOT = default_root()
+DEFAULT_ROOT = Path(
+    os.environ.get(
+        "OPENCLAW_WORKSPACE",
+        str(Path.home() / ".openclaw" / "workspace"),
+    )
+)
 ACTIVE_STATES = {"running", "waiting_subagent", "waiting_user", "verifying"}
 TERMINAL_STATES = {"reported", "abandoned"}
+UNREPORTED_TERMINAL_STATES = {"completed_unreported", "failed_unreported"}
+NON_MATERIAL_RECOVERY_EVENTS = {"recovery_wake_delivered", "hook_observed", "visible_update_sent", "wait_reminder_sent"}
+ROUTE_PROOF_KEYS = {
+    "message_id",
+    "last_update_message_id",
+    "last_wait_reminder_message_id",
+    "delivery_message_id",
+}
+VISIBLE_DELIVERY_ROUTE_KEYS = {"session_key", "sessionKey", "channel", "target", "to", "accountId", "threadId"}
+ACTIVE_STATUS_EVENT_TRANSITIONS = {
+    "wait": "__wait_status__",
+    "verify": "verifying",
+    "complete": "completed_unreported",
+    "fail": "failed_unreported",
+    "abandon": "abandoned",
+}
+UNREPORTED_TERMINAL_EVENT_TRANSITIONS = {
+    "report_sent": "reported",
+    "abandon": "abandoned",
+}
 WORK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 SIDE_EFFECT_CLASSES = {
     "read_only",
@@ -57,6 +76,7 @@ EVENT_TYPES = {
     "report_sent",
     "abandon",
     "recovery_wake_delivered",
+    "hook_observed",
 }
 REPEAT_POLICIES = {"repeatable", "reconcile_first", "never_repeat_without_user_approval"}
 DEFAULT_REPEAT_POLICY = {
@@ -75,6 +95,12 @@ DEFAULT_THRESHOLDS_SECONDS = {
     "verifying": 20 * 60,
     "completed_unreported": 0,
     "failed_unreported": 0,
+}
+DEFAULT_ORPHAN_MIN_AGE_SECONDS = 30 * 60
+DEFAULT_ORPHAN_WARNING_SUPPRESSION_SECONDS = 24 * 60 * 60
+ORPHAN_HANDLED_RESOLUTIONS = {
+    "terminal_no_action",
+    "referenced_after_refresh",
 }
 MIN_STALE_AFTER_SECONDS = {
     "running": 5 * 60,
@@ -152,6 +178,12 @@ def load_json_string_list_arg(value: str | None, name: str) -> list[str]:
     return parsed
 
 
+def load_optional_json_string_list_arg(value: str | None, name: str) -> list[str] | None:
+    if value is None:
+        return None
+    return load_json_string_list_arg(value, name)
+
+
 def load_json_object_arg(value: str | None, name: str, *, required: bool = False) -> dict[str, Any] | None:
     if value is None:
         if required:
@@ -175,6 +207,50 @@ def validate_visible_delivery(value: dict[str, Any] | None, name: str, *, requir
     if not (has_session or has_channel_target):
         raise SystemExit(f"{name} must include session_key/sessionKey or channel plus target/to")
     return value
+
+
+def canonical_visible_delivery_route(value: dict[str, Any]) -> dict[str, Any]:
+    route: dict[str, Any] = {}
+    session_key = value.get("session_key") or value.get("sessionKey")
+    if session_key not in (None, ""):
+        route["session_key"] = session_key
+    channel = value.get("channel")
+    target = value.get("target") or value.get("to")
+    if channel not in (None, ""):
+        route["channel"] = channel
+    if target not in (None, ""):
+        route["target"] = normalize_visible_delivery_target(channel, target)
+    for key in ("accountId", "threadId"):
+        if value.get(key) not in (None, ""):
+            route[key] = value[key]
+    return route
+
+
+def normalize_visible_delivery_target(channel: Any, target: Any) -> Any:
+    if channel != "telegram" or not isinstance(target, str):
+        return target
+    if target.startswith("telegram:"):
+        return target.split(":", 1)[1]
+    if target.startswith("telegram-"):
+        return target.split("-", 1)[1]
+    return target
+
+
+def assert_visible_delivery_matches_existing(existing: dict[str, Any], reported: dict[str, Any]) -> None:
+    expected_route = canonical_visible_delivery_route(
+        existing.get("completion_visible_delivery") or existing.get("visible_delivery") or {}
+    )
+    reported_route = canonical_visible_delivery_route(reported)
+    if not expected_route:
+        return
+    if reported_route != expected_route:
+        raise SystemExit("report-sent visible_delivery route mismatch")
+    for key, expected_value in expected_route.items():
+        reported_value = reported_route.get(key)
+        if reported_value in (None, ""):
+            raise SystemExit(f"report-sent visible_delivery missing original route key: {key}")
+        if reported_value != expected_value:
+            raise SystemExit(f"report-sent visible_delivery route mismatch for {key}")
 
 
 def validate_owner_session_key(value: str | None) -> str:
@@ -282,6 +358,20 @@ def merge_list(existing: list[Any], incoming: list[Any]) -> list[Any]:
     return result
 
 
+def transition_status(current_status: str, event: dict[str, Any]) -> str:
+    event_type = event.get("event_type")
+    if current_status in UNREPORTED_TERMINAL_STATES:
+        return UNREPORTED_TERMINAL_EVENT_TRANSITIONS.get(event_type, current_status)
+    if event_type == "start":
+        return "running"
+    if current_status in TERMINAL_STATES:
+        return current_status
+    next_status = ACTIVE_STATUS_EVENT_TRANSITIONS.get(event_type)
+    if next_status == "__wait_status__":
+        return event.get("status") or "waiting_subagent"
+    return next_status or current_status
+
+
 def derive_state(work_id: str, events: list[dict[str, Any]]) -> dict[str, Any]:
     events = sorted(events, key=lambda e: int(e.get("sequence", 0)))
     state: dict[str, Any] = {
@@ -299,13 +389,19 @@ def derive_state(work_id: str, events: list[dict[str, Any]]) -> dict[str, Any]:
         "side_effect_class": "read_only",
         "side_effects_performed": [],
         "external_actions_attempted": [],
+        "hook_observations": [],
+        "hook_fingerprints": [],
         "no_artifact_expected": False,
         "visible_delivery": {},
+        "completion_visible_delivery": {},
+        "visible_delivery_proof": {},
         "completion_report_sent": False,
         "last_event": None,
         "last_progress_at": None,
         "last_visible_update_at": None,
         "last_wait_reminder_at": None,
+        "terminal_unreported_event": None,
+        "terminal_unreported_next_recovery_action": None,
         "last_activity_at": None,
         "stale_after_seconds": None,
         "created_at": None,
@@ -320,7 +416,7 @@ def derive_state(work_id: str, events: list[dict[str, Any]]) -> dict[str, Any]:
         state["events_count"] += 1
         state["last_event"] = event
         state["updated_at"] = event.get("event_at")
-        if event_type != "recovery_wake_delivered":
+        if event_type not in NON_MATERIAL_RECOVERY_EVENTS:
             state["last_material_event"] = event
         if state["created_at"] is None:
             state["created_at"] = event.get("created_at") or event.get("event_at")
@@ -355,7 +451,14 @@ def derive_state(work_id: str, events: list[dict[str, Any]]) -> dict[str, Any]:
         if event.get("verification"):
             state["verification"] = event["verification"]
         if event.get("visible_delivery"):
-            state["visible_delivery"] = {**state.get("visible_delivery", {}), **event["visible_delivery"]}
+            if event_type == "start":
+                state["visible_delivery"] = {**state.get("visible_delivery", {}), **event["visible_delivery"]}
+                state["completion_visible_delivery"] = canonical_visible_delivery_route(event["visible_delivery"])
+            elif event_type == "report_sent":
+                # Do not let progress/reminder delivery routes change the
+                # original completion-report route. Report-sent validation uses
+                # completion_visible_delivery and stores only proof ids here.
+                pass
         for key in (
             "expected_outputs",
             "artifact_paths",
@@ -364,40 +467,38 @@ def derive_state(work_id: str, events: list[dict[str, Any]]) -> dict[str, Any]:
             "subagent_session_keys",
             "side_effects_performed",
             "external_actions_attempted",
+            "hook_observations",
+            "hook_fingerprints",
         ):
             if event.get(key):
                 state[key] = merge_list(state.get(key, []), event[key])
 
         if event_type in {"start", "progress", "wait", "verify"}:
             state["last_progress_at"] = event.get("event_at")
-        if event_type == "start":
-            current_status = "running"
-        if event_type == "wait":
-            current_status = event.get("status") or "waiting_subagent"
-        elif event_type == "verify":
-            current_status = "verifying"
-        elif event_type == "complete":
-            current_status = "completed_unreported"
-        elif event_type == "fail":
-            current_status = "failed_unreported"
+        next_status = transition_status(current_status, event)
+        if event_type == "complete" and next_status == "completed_unreported" and current_status != next_status:
+            state["terminal_unreported_event"] = event
+            state["terminal_unreported_next_recovery_action"] = state.get("next_recovery_action")
+        elif event_type == "fail" and next_status == "failed_unreported" and current_status != next_status:
             state["failure_reason"] = event.get("failure_reason") or event.get("note")
-        elif event_type == "report_sent":
-            current_status = "reported"
+            state["terminal_unreported_event"] = event
+            state["terminal_unreported_next_recovery_action"] = state.get("next_recovery_action")
+        current_status = next_status
+        if event_type == "report_sent" and current_status == "reported":
             state["completion_report_sent"] = True
             state["report_sent_at"] = event.get("event_at")
             if event.get("delivery_message_id"):
-                state.setdefault("visible_delivery", {})["message_id"] = event["delivery_message_id"]
+                state.setdefault("visible_delivery_proof", {})["message_id"] = event["delivery_message_id"]
         elif event_type == "visible_update_sent":
             state["last_visible_update_at"] = event.get("event_at")
             if event.get("delivery_message_id"):
-                state.setdefault("visible_delivery", {})["last_update_message_id"] = event["delivery_message_id"]
+                state.setdefault("visible_delivery_proof", {})["last_update_message_id"] = event["delivery_message_id"]
         elif event_type == "wait_reminder_sent":
             state["last_visible_update_at"] = event.get("event_at")
             state["last_wait_reminder_at"] = event.get("event_at")
             if event.get("delivery_message_id"):
-                state.setdefault("visible_delivery", {})["last_wait_reminder_message_id"] = event["delivery_message_id"]
-        elif event_type == "abandon":
-            current_status = "abandoned"
+                state.setdefault("visible_delivery_proof", {})["last_wait_reminder_message_id"] = event["delivery_message_id"]
+        elif event_type == "abandon" and current_status == "abandoned":
             state["abandon_reason"] = event.get("abandon_reason") or event.get("note")
 
         if event_type == "recovery_wake_delivered":
@@ -452,16 +553,132 @@ def write_all_states(root: Path) -> list[dict[str, Any]]:
         return write_all_states_unlocked(root)
 
 
+def orphan_warnings_path(root: Path) -> Path:
+    return ledger_dir(root) / "orphan_warnings.json"
+
+
+def load_orphan_warnings(root: Path) -> dict[str, Any]:
+    path = orphan_warnings_path(root)
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def record_orphan_warning(
+    root: Path,
+    orphan_fingerprint: str,
+    *,
+    visible_delivery: dict[str, Any] | None = None,
+    delivery_message_id: str | None = None,
+    note: str | None = None,
+    orphan_fingerprints: list[str] | None = None,
+) -> dict[str, Any]:
+    if not re.fullmatch(r"[a-f0-9]{64}", orphan_fingerprint):
+        raise SystemExit("invalid orphan fingerprint")
+    fingerprints = normalize_orphan_fingerprints(orphan_fingerprint, orphan_fingerprints)
+    visible_delivery = validate_visible_delivery(visible_delivery, "--visible-delivery", required=True)
+    if not delivery_message_id:
+        raise SystemExit("--delivery-message-id is required")
+    with file_lock(root):
+        warnings = load_orphan_warnings(root)
+        item = {
+            "warned_at": now_iso(),
+            "orphan_fingerprint": orphan_fingerprint,
+            "visible_delivery": canonical_visible_delivery_route(visible_delivery),
+        }
+        if delivery_message_id:
+            item["delivery_message_id"] = delivery_message_id
+        if note:
+            item["note"] = note
+        if len(fingerprints) > 1:
+            item["orphan_fingerprints"] = fingerprints
+        for fingerprint in fingerprints:
+            warnings[fingerprint] = dict(item, orphan_fingerprint=fingerprint)
+        atomic_write_json(orphan_warnings_path(root), warnings)
+    return item
+
+
+def record_orphan_handled(
+    root: Path,
+    orphan_fingerprint: str,
+    *,
+    resolution: str,
+    note: str | None = None,
+    orphan_fingerprints: list[str] | None = None,
+) -> dict[str, Any]:
+    if not re.fullmatch(r"[a-f0-9]{64}", orphan_fingerprint):
+        raise SystemExit("invalid orphan fingerprint")
+    fingerprints = normalize_orphan_fingerprints(orphan_fingerprint, orphan_fingerprints)
+    if resolution not in ORPHAN_HANDLED_RESOLUTIONS:
+        allowed = ", ".join(sorted(ORPHAN_HANDLED_RESOLUTIONS))
+        raise SystemExit(f"--resolution must be one of: {allowed}")
+    if not note:
+        raise SystemExit("--note is required")
+    with file_lock(root):
+        warnings = load_orphan_warnings(root)
+        item = {
+            "handled_at": now_iso(),
+            "orphan_fingerprint": orphan_fingerprint,
+            "resolution": resolution,
+        }
+        if note:
+            item["note"] = note
+        if len(fingerprints) > 1:
+            item["orphan_fingerprints"] = fingerprints
+        for fingerprint in fingerprints:
+            warnings[fingerprint] = dict(item, orphan_fingerprint=fingerprint)
+        atomic_write_json(orphan_warnings_path(root), warnings)
+    return item
+
+
+def normalize_orphan_fingerprints(orphan_fingerprint: str, aliases: list[str] | None = None) -> list[str]:
+    values = [orphan_fingerprint]
+    if aliases:
+        values.extend(aliases)
+    normalized: list[str] = []
+    for value in values:
+        if not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value):
+            raise SystemExit("invalid orphan fingerprint")
+        if value not in normalized:
+            normalized.append(value)
+    return normalized
+
+
+def orphan_warning_has_delivery_proof(warning: dict[str, Any]) -> bool:
+    visible_delivery = warning.get("visible_delivery")
+    if not isinstance(visible_delivery, dict):
+        return False
+    return bool(warning.get("delivery_message_id")) and bool(canonical_visible_delivery_route(visible_delivery))
+
+
+def orphan_handled_is_valid(warning: dict[str, Any]) -> bool:
+    note = warning.get("note")
+    return (
+        bool(warning.get("handled_at"))
+        and warning.get("resolution") in ORPHAN_HANDLED_RESOLUTIONS
+        and isinstance(note, str)
+        and bool(note.strip())
+    )
+
+
 def load_states(root: Path) -> list[dict[str, Any]]:
     return write_all_states(root)
 
 
 def recovery_fingerprint(state: dict[str, Any]) -> str:
+    terminal_unreported_event = state.get("terminal_unreported_event") or {}
+    use_terminal_anchor = state.get("status") in UNREPORTED_TERMINAL_STATES and terminal_unreported_event
     payload = {
         "work_id": state.get("work_id"),
         "status": state.get("status"),
-        "last_material_event_sequence": (state.get("last_material_event") or {}).get("sequence"),
-        "next_recovery_action": state.get("next_recovery_action"),
+        "last_material_event_sequence": terminal_unreported_event.get("sequence") if use_terminal_anchor else None,
+        "next_recovery_action": (
+            state.get("terminal_unreported_next_recovery_action") if use_terminal_anchor else state.get("next_recovery_action")
+        ),
         "expected_outputs": state.get("expected_outputs"),
         "artifact_paths": state.get("artifact_paths"),
         "verification": state.get("verification"),
@@ -527,23 +744,24 @@ def make_recovery_packet(root: Path, state: dict[str, Any], reason: str) -> dict
         recovery_instruction = (
             "This ledger entry lacks enough durable context for confident recovery. "
             "Do not guess the original request or repeat side effects. Inspect the ledger events, "
-            "current artifacts/tasks, and conversation context available to this session; then either "
+            "current artifacts/tasks/subagents; then either "
             "repair the ledger with explicit context, ask the user for the missing decision, or mark the work blocked/abandoned."
         )
     elif status == "waiting_user":
         recovery_instruction = (
             "This work is waiting for user input and may not be stuck. Reconcile current conversation "
             "state first. If the user has answered, continue the work, verify, send the visible completion "
-            "report, then record report_sent. If still blocked on user input, send at most one concise "
-            "waiting reminder and record a fresh wait event instead of report_sent."
+            "report, then record report-sent. If still blocked on user input, send at most one concise "
+            "waiting reminder and record a fresh wait event instead of report-sent."
         )
     else:
         recovery_instruction = (
             "You are recovering unfinished work, not merely notifying. Read this ledger state, "
             "inspect current artifacts/tasks before acting, do not repeat external/destructive "
             "side effects without user approval, execute the next safe recovery action, verify, "
-            "send one visible completion report, then record report_sent."
+            "send one visible completion report, then record report-sent."
         )
+    visible_delivery_route = state.get("completion_visible_delivery") or canonical_visible_delivery_route(state.get("visible_delivery") or {})
     packet = {
         "schema_version": SCHEMA_VERSION,
         "packet_type": "work_recovery",
@@ -574,7 +792,8 @@ def make_recovery_packet(root: Path, state: dict[str, Any], reason: str) -> dict
         "work_created_at": state.get("created_at"),
         "work_updated_at": state.get("updated_at"),
         "last_material_event": state.get("last_material_event"),
-        "visible_delivery": state.get("visible_delivery", {}),
+        "visible_delivery": visible_delivery_route,
+        "visible_delivery_proof": state.get("visible_delivery_proof", {}),
         "user_message_timestamp": state.get("user_message_timestamp"),
         "last_visible_update_at": state.get("last_visible_update_at"),
         "last_wait_reminder_at": state.get("last_wait_reminder_at"),
@@ -612,6 +831,386 @@ def scan_recoveries(root: Path, cooldown_seconds: int) -> list[dict[str, Any]]:
     return packets
 
 
+def normalized_task_identity_values(value: str) -> set[str]:
+    values = {value}
+    if value.startswith("codex-thread:"):
+        values.add(value.split(":", 1)[1])
+    elif re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", value):
+        values.add(f"codex-thread:{value}")
+    return values
+
+
+def task_identity_values(task: dict[str, Any]) -> set[str]:
+    values: set[str] = set()
+    for key in ("taskId", "runId", "childSessionKey", "sessionKey", "agent_id", "agentId"):
+        value = task.get(key)
+        if isinstance(value, str) and value:
+            values.update(normalized_task_identity_values(value))
+    return values
+
+
+def task_specificity_score(task: dict[str, Any]) -> tuple[int, int, int, int]:
+    return (
+        1 if task.get("runtime") == "subagent" else 0,
+        1 if task.get("childSessionKey") or task.get("sessionKey") else 0,
+        1 if task.get("label") else 0,
+        len(task_identity_values(task)),
+    )
+
+
+def task_age_seconds(task: dict[str, Any], now_ms: int) -> int | None:
+    candidates = [
+        task.get("startedAt"),
+        task.get("createdAt"),
+        task.get("lastEventAt"),
+    ]
+    timestamps = [value for value in candidates if isinstance(value, (int, float)) and value > 0]
+    if not timestamps:
+        return None
+    return max(0, int((now_ms - min(timestamps)) / 1000))
+
+
+def task_idle_seconds(task: dict[str, Any], now_ms: int) -> int | None:
+    for key in ("lastEventAt", "startedAt", "createdAt"):
+        value = task.get(key)
+        if isinstance(value, (int, float)) and value > 0:
+            return max(0, int((now_ms - value) / 1000))
+    return None
+
+
+def orphan_identity_payload(task: dict[str, Any]) -> dict[str, Any] | None:
+    for key in ("runId", "childSessionKey", "sessionKey", "taskId"):
+        value = task.get(key)
+        if isinstance(value, str) and value:
+            return {"key": key, "value": value}
+    return None
+
+
+def orphan_identity_payloads(task: dict[str, Any]) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for key in ("runId", "childSessionKey", "sessionKey", "taskId"):
+        value = task.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        item = (key, value)
+        if item in seen:
+            continue
+        seen.add(item)
+        payloads.append({"key": key, "value": value})
+    return payloads
+
+
+def orphan_identity_fingerprints(task: dict[str, Any]) -> list[str]:
+    return [
+        hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+        for payload in orphan_identity_payloads(task)
+    ]
+
+
+def orphan_identity_fingerprint(task: dict[str, Any]) -> str | None:
+    fingerprints = orphan_identity_fingerprints(task)
+    if not fingerprints:
+        return None
+    return fingerprints[0]
+
+
+def collect_active_task_refs(root: Path) -> set[str]:
+    refs: set[str] = set()
+    for state in load_states(root):
+        if state.get("status") not in ACTIVE_STATES:
+            continue
+        for key in ("openclaw_task_ids", "subagent_session_keys"):
+            for value in state.get(key, []):
+                if isinstance(value, str) and value:
+                    refs.update(normalized_task_identity_values(value))
+        for subagent in state.get("subagents", []):
+            if not isinstance(subagent, dict):
+                continue
+            for key in ("taskId", "runId", "sessionKey", "childSessionKey", "agent_id", "agentId"):
+                value = subagent.get(key)
+                if isinstance(value, str) and value:
+                    refs.update(normalized_task_identity_values(value))
+    return refs
+
+
+def load_openclaw_tasks(status: str) -> tuple[list[dict[str, Any]], str | None]:
+    try:
+        proc = subprocess.run(
+            ["openclaw", "tasks", "list", "--json", "--status", status],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [], str(exc)
+    if proc.returncode != 0:
+        return [], (proc.stderr or proc.stdout or f"openclaw tasks list exited {proc.returncode}").strip()
+    try:
+        parsed = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        return [], f"invalid tasks JSON: {exc}"
+    tasks = parsed.get("tasks", [])
+    if not isinstance(tasks, list):
+        return [], "tasks JSON did not contain a tasks array"
+    return [task for task in tasks if isinstance(task, dict)], None
+
+
+def find_orphan_active_work(root: Path, *, include_cron: bool = False, min_age_seconds: int = DEFAULT_ORPHAN_MIN_AGE_SECONDS) -> dict[str, Any]:
+    ledger_refs = collect_active_task_refs(root)
+    now_ms = int(time.time() * 1000)
+    now_ts = time.time()
+    warned = load_orphan_warnings(root)
+    statuses = ("queued", "running")
+    tasks: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for status in statuses:
+        status_tasks, error = load_openclaw_tasks(status)
+        tasks.extend(status_tasks)
+        if error:
+            errors.append(f"{status}: {error}")
+
+    orphans: list[dict[str, Any]] = []
+    ignored: list[dict[str, Any]] = []
+    referenced_task_identities: set[str] = set()
+    for task in tasks:
+        identities = task_identity_values(task)
+        if identities & ledger_refs:
+            referenced_task_identities.update(identities)
+    seen_identities: set[str] = set()
+    tasks = sorted(tasks, key=task_specificity_score, reverse=True)
+    for task in tasks:
+        identities = task_identity_values(task)
+        if identities & referenced_task_identities:
+            continue
+        if identities and identities & seen_identities:
+            continue
+        seen_identities.update(identities)
+        is_watchdog = task.get("runtime") == "cron" and task.get("label") == "work-ledger-watchdog-v1"
+        if task.get("runtime") == "cron" and not include_cron:
+            ignored.append({"taskId": task.get("taskId"), "runtime": task.get("runtime"), "label": task.get("label"), "reason": "cron"})
+            continue
+        if is_watchdog:
+            ignored.append({"taskId": task.get("taskId"), "runtime": task.get("runtime"), "label": task.get("label"), "reason": "self"})
+            continue
+        age_seconds = task_age_seconds(task, now_ms)
+        idle_seconds = task_idle_seconds(task, now_ms)
+        freshness_seconds = idle_seconds if idle_seconds is not None else age_seconds
+        if freshness_seconds is not None and freshness_seconds < min_age_seconds:
+            ignored.append({
+                "taskId": task.get("taskId"),
+                "runId": task.get("runId"),
+                "runtime": task.get("runtime"),
+                "label": task.get("label"),
+                "reason": "fresh",
+                "age_seconds": age_seconds,
+                "idle_seconds": idle_seconds,
+                "min_age_seconds": min_age_seconds,
+            })
+            continue
+        fingerprint = orphan_identity_fingerprint(task)
+        fingerprints = orphan_identity_fingerprints(task)
+        if not fingerprint:
+            orphans.append({
+                "taskId": task.get("taskId"),
+                "runId": task.get("runId"),
+                "runtime": task.get("runtime"),
+                "status": task.get("status"),
+                "label": task.get("label"),
+                "task": task.get("task"),
+                "ownerKey": task.get("ownerKey"),
+                "childSessionKey": task.get("childSessionKey"),
+                "createdAt": task.get("createdAt"),
+                "startedAt": task.get("startedAt"),
+                "lastEventAt": task.get("lastEventAt"),
+                "age_seconds": age_seconds,
+                "idle_seconds": idle_seconds,
+                "suppression_supported": False,
+                "reason": "unfingerprintable",
+            })
+            continue
+        warning = next((warned.get(alias) for alias in fingerprints if isinstance(warned.get(alias), dict)), None)
+        suppress_ts = 0.0
+        suppress_reason = "warned"
+        suppress_at = None
+        if isinstance(warning, dict):
+            has_warning_proof = orphan_warning_has_delivery_proof(warning)
+            if orphan_handled_is_valid(warning) and not warning.get("warned_at"):
+                suppress_reason = "handled"
+                suppress_at = warning.get("handled_at")
+            elif has_warning_proof:
+                suppress_at = warning.get("warned_at")
+            suppress_ts = parse_time(suppress_at)
+        if suppress_reason == "handled" and suppress_ts:
+            ignored.append({
+                "taskId": task.get("taskId"),
+                "runId": task.get("runId"),
+                "runtime": task.get("runtime"),
+                "label": task.get("label"),
+                "reason": suppress_reason,
+                "orphan_fingerprint": fingerprint,
+                "orphan_fingerprints": fingerprints,
+                "handled_at": warning.get("handled_at") if isinstance(warning, dict) else None,
+                "resolution": warning.get("resolution") if isinstance(warning, dict) else None,
+                "suppress_seconds": None,
+            })
+            continue
+        if suppress_ts and now_ts - suppress_ts < DEFAULT_ORPHAN_WARNING_SUPPRESSION_SECONDS:
+            ignored.append({
+                "taskId": task.get("taskId"),
+                "runId": task.get("runId"),
+                "runtime": task.get("runtime"),
+                "label": task.get("label"),
+                "reason": suppress_reason,
+                "orphan_fingerprint": fingerprint,
+                "orphan_fingerprints": fingerprints,
+                "warned_at": warning.get("warned_at") if isinstance(warning, dict) else None,
+                "handled_at": warning.get("handled_at") if isinstance(warning, dict) else None,
+                "resolution": warning.get("resolution") if isinstance(warning, dict) else None,
+                "suppress_seconds": DEFAULT_ORPHAN_WARNING_SUPPRESSION_SECONDS,
+            })
+            continue
+        orphans.append({
+            "taskId": task.get("taskId"),
+            "runId": task.get("runId"),
+            "runtime": task.get("runtime"),
+            "status": task.get("status"),
+            "label": task.get("label"),
+            "task": task.get("task"),
+            "ownerKey": task.get("ownerKey"),
+            "childSessionKey": task.get("childSessionKey"),
+            "createdAt": task.get("createdAt"),
+            "startedAt": task.get("startedAt"),
+            "lastEventAt": task.get("lastEventAt"),
+            "age_seconds": age_seconds,
+            "idle_seconds": idle_seconds,
+            "orphan_fingerprint": fingerprint,
+            "orphan_fingerprints": fingerprints,
+        })
+
+    return {
+        "ok": not errors,
+        "has_orphans": bool(orphans),
+        "orphans": orphans,
+        "ignored": ignored[:20],
+        "errors": errors,
+        "min_age_seconds": min_age_seconds,
+        "policy": "refresh_before_user_message; ignores fresh tasks by default; handled orphans are durably suppressed; visible warnings require delivery proof and suppress repeats for 24h; do not auto-create ledger entries or recover from this output alone",
+    }
+
+
+QUICK_START_PRESETS: dict[str, dict[str, Any]] = {
+    "coding": {
+        "side_effect_class": "repo_changes",
+        "checklist": ["inspect current state", "make scoped code changes", "run verification", "send visible completion report"],
+        "success_criteria": ["requested code change is complete", "verification result is recorded", "visible report is sent"],
+        "stale_after_seconds": 30 * 60,
+        "repeat_policy": "reconcile_first",
+    },
+    "local-files": {
+        "side_effect_class": "local_files",
+        "checklist": ["inspect current files", "make scoped file changes", "verify result", "send visible completion report"],
+        "success_criteria": ["requested file work is complete", "verification result is recorded", "visible report is sent"],
+        "stale_after_seconds": 30 * 60,
+        "repeat_policy": "reconcile_first",
+    },
+    "subagent": {
+        "side_effect_class": "read_only",
+        "checklist": ["start or observe subagent work", "record wait state", "integrate result", "send visible completion report"],
+        "success_criteria": ["subagent result is reconciled", "visible report is sent"],
+        "stale_after_seconds": 60 * 60,
+        "repeat_policy": "reconcile_first",
+    },
+    "browser": {
+        "side_effect_class": "local_files",
+        "checklist": ["open browser only as needed", "close browser tab", "verify result", "send visible completion report"],
+        "success_criteria": ["browser work is complete and closed", "visible report is sent"],
+        "stale_after_seconds": 20 * 60,
+        "repeat_policy": "reconcile_first",
+    },
+    "cron-gateway": {
+        "side_effect_class": "gateway_runtime",
+        "checklist": ["inspect cron/gateway state", "make approved scoped change", "verify health/state", "send visible completion report"],
+        "success_criteria": ["cron/gateway state is verified", "visible report is sent"],
+        "stale_after_seconds": 20 * 60,
+        "repeat_policy": "never_repeat_without_user_approval",
+    },
+    "external": {
+        "side_effect_class": "external_message",
+        "checklist": ["confirm durable clearance", "perform external action once", "verify delivery/result", "send visible completion report"],
+        "success_criteria": ["external action is reconciled", "visible report is sent"],
+        "stale_after_seconds": 20 * 60,
+        "repeat_policy": "never_repeat_without_user_approval",
+    },
+    "long-readonly": {
+        "side_effect_class": "read_only",
+        "checklist": ["inspect sources/state", "complete read-only analysis", "verify facts", "send visible completion report"],
+        "success_criteria": ["analysis is complete", "visible report is sent"],
+        "stale_after_seconds": 30 * 60,
+        "repeat_policy": "repeatable",
+    },
+}
+
+
+def slugify_work_id(value: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_.:-]+", "-", value.strip().lower()).strip("-._:")
+    if not slug:
+        slug = "work"
+    return slug[:72]
+
+
+def command_quick_start(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+    preset = QUICK_START_PRESETS[args.kind]
+    work_id = args.work_id
+    if not work_id:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        work_id = f"{args.kind}-{slugify_work_id(args.summary)}-{stamp}"
+    validate_work_id(work_id)
+    validate_owner_session_key(args.owner_session_key)
+    visible_delivery = validate_visible_delivery(
+        load_json_object_arg(args.visible_delivery, "--visible-delivery", required=True),
+        "--visible-delivery",
+        required=True,
+    )
+    side_effect_class = args.side_effect_class or preset["side_effect_class"]
+    repeat_policy = args.repeat_policy or preset["repeat_policy"]
+    idempotency_key = args.idempotency_key
+    if side_effect_class in {"external_message", "public_post", "destructive", "gateway_runtime"} and not idempotency_key:
+        idempotency_key = hashlib.sha256(f"{work_id}:{side_effect_class}".encode("utf-8")).hexdigest()[:24]
+    event_args = argparse.Namespace(
+        work_id=work_id,
+        note=args.note or f"quick-start preset: {args.kind}",
+        next_recovery_action=args.next_recovery_action or "Reconcile current state, execute only the next safe action, verify, send visible report, then record report-sent.",
+        expected_outputs=args.expected_outputs,
+        artifact_paths=args.artifact_paths,
+        openclaw_task_ids=args.openclaw_task_ids,
+        subagent_session_keys=args.subagent_session_keys,
+        subagents=args.subagents,
+        verification=None,
+        side_effects_performed=None,
+        external_actions_attempted=None,
+        request_summary=args.summary,
+        owner_session_key=args.owner_session_key,
+        user_message_id=args.user_message_id,
+        user_message_timestamp=args.user_message_timestamp,
+        checklist=json.dumps(args.checklist or preset["checklist"]),
+        success_criteria=json.dumps(args.success_criteria or preset["success_criteria"]),
+        side_effect_class=side_effect_class,
+        cwd=args.cwd or str(DEFAULT_ROOT),
+        branch=args.branch,
+        commit=args.commit,
+        idempotency_key=idempotency_key,
+        repeat_policy=repeat_policy,
+        stale_after_seconds=args.stale_after_seconds or preset["stale_after_seconds"],
+        no_artifact_expected=args.no_artifact_expected,
+        resume_start=args.resume_start,
+        visible_delivery=json.dumps(visible_delivery),
+    )
+    event = command_event(root, event_args, "start")
+    return {"ok": True, "work_id": work_id, "kind": args.kind, "event": event}
+
+
 def validate_start(args: argparse.Namespace) -> None:
     validate_work_id(args.work_id)
     if args.side_effect_class not in SIDE_EFFECT_CLASSES:
@@ -635,10 +1234,11 @@ def command_event(root: Path, args: argparse.Namespace, event_type: str) -> dict
     if event_type not in EVENT_TYPES:
         raise SystemExit(f"invalid event type: {event_type}")
     validate_work_id(args.work_id)
+    reported_visible_delivery: dict[str, Any] | None = None
     if event_type == "start":
         validate_start(args)
     if event_type == "report_sent":
-        validate_visible_delivery(
+        reported_visible_delivery = validate_visible_delivery(
             load_json_object_arg(getattr(args, "visible_delivery", None), "--visible-delivery", required=True),
             "--visible-delivery",
             required=True,
@@ -668,7 +1268,7 @@ def command_event(root: Path, args: argparse.Namespace, event_type: str) -> dict
         "checklist": load_json_arg(getattr(args, "checklist", None), None),
         "success_criteria": load_json_arg(getattr(args, "success_criteria", None), None),
         "verification": load_json_arg(getattr(args, "verification", None), None),
-        "visible_delivery": validate_visible_delivery(
+        "visible_delivery": reported_visible_delivery if event_type == "report_sent" else validate_visible_delivery(
             load_json_object_arg(getattr(args, "visible_delivery", None), "--visible-delivery"),
             "--visible-delivery",
         ),
@@ -688,13 +1288,65 @@ def command_event(root: Path, args: argparse.Namespace, event_type: str) -> dict
             existing = grouped_events(root).get(args.work_id)
             if existing:
                 existing_state = derive_state(args.work_id, existing)
+                if existing_state.get("status") in UNREPORTED_TERMINAL_STATES:
+                    raise SystemExit("resume-start is not allowed after complete/fail leaves work unreported")
                 if existing_state.get("status") not in {"reported", "abandoned"} and not getattr(args, "resume_start", False):
                     raise SystemExit(f"active work_id already exists: {args.work_id}")
             return append_event_unlocked(root, event)
     with file_lock(root):
-        if args.work_id not in grouped_events(root):
+        existing_events = grouped_events(root).get(args.work_id)
+        if not existing_events:
             raise SystemExit(f"unknown work_id: {args.work_id}")
+        if event_type == "report_sent":
+            existing_state = derive_state(args.work_id, existing_events)
+            if existing_state.get("status") not in {"completed_unreported", "failed_unreported"}:
+                raise SystemExit("report-sent is allowed only after complete or fail leaves work unreported")
+            assert_visible_delivery_matches_existing(existing_state, event.get("visible_delivery") or {})
         return append_event_unlocked(root, event)
+
+
+def command_hook_observe(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+    validate_work_id(args.work_id)
+    payload = load_json_object_arg(args.payload, "--payload", required=True)
+    observation = ledger_observation(payload)
+    fingerprint = observation["fingerprint"]
+    with file_lock(root):
+        existing = grouped_events(root).get(args.work_id)
+        if not existing:
+            raise SystemExit(f"unknown work_id: {args.work_id}")
+        state = derive_state(args.work_id, existing)
+        if fingerprint in state.get("hook_fingerprints", []):
+            return {"ok": True, "duplicate": True, "observation": observation}
+        event: dict[str, Any] = {
+            "event_type": "hook_observed",
+            "work_id": args.work_id,
+            "note": args.note or f"hook observed: {observation['event']}",
+            "hook_observations": [observation],
+            "hook_fingerprints": [fingerprint],
+        }
+        if args.next_recovery_action:
+            event["hook_candidate_next_recovery_action"] = args.next_recovery_action
+        if observation.get("candidate_event_type") == "verify":
+            event["verification"] = {
+                "hook_candidate": observation.get("tool_name") or observation.get("event"),
+                "hook_fingerprint": fingerprint,
+            }
+        return {
+            "ok": True,
+            "duplicate": False,
+            "event": append_event_unlocked(root, {key: value for key, value in event.items() if value not in (None, [], {})}),
+            "observation": observation,
+        }
+
+
+def command_hook_guardrail(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+    validate_work_id(args.work_id)
+    payload = load_json_object_arg(args.payload, "--payload", required=True)
+    events = grouped_events(root).get(args.work_id)
+    if not events:
+        raise SystemExit(f"unknown work_id: {args.work_id}")
+    state = derive_state(args.work_id, events)
+    return {"ok": True, "decision": ledger_guardrail(payload, state), "state_status": state.get("status")}
 
 
 def add_common_event_args(parser: argparse.ArgumentParser) -> None:
@@ -735,6 +1387,33 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--resume-start", action="store_true", help="Allow another start event for an active work_id")
     start.add_argument("--visible-delivery")
 
+    quick = sub.add_parser("quick-start", help="Start a selective ledger entry from a small preset; not for every short request")
+    quick.add_argument("--kind", required=True, choices=sorted(QUICK_START_PRESETS))
+    quick.add_argument("--summary", required=True)
+    quick.add_argument("--work-id")
+    quick.add_argument("--owner-session-key", required=True)
+    quick.add_argument("--visible-delivery", required=True)
+    quick.add_argument("--user-message-id")
+    quick.add_argument("--user-message-timestamp")
+    quick.add_argument("--expected-outputs", help="Comma-separated paths or result labels")
+    quick.add_argument("--artifact-paths", help="Comma-separated paths")
+    quick.add_argument("--openclaw-task-ids", help="Comma-separated ids")
+    quick.add_argument("--subagent-session-keys", help="Comma-separated session keys")
+    quick.add_argument("--subagents", help="JSON array")
+    quick.add_argument("--side-effect-class", choices=sorted(SIDE_EFFECT_CLASSES))
+    quick.add_argument("--repeat-policy", choices=sorted(REPEAT_POLICIES))
+    quick.add_argument("--idempotency-key")
+    quick.add_argument("--stale-after-seconds", type=int)
+    quick.add_argument("--cwd")
+    quick.add_argument("--branch")
+    quick.add_argument("--commit")
+    quick.add_argument("--note")
+    quick.add_argument("--next-recovery-action")
+    quick.add_argument("--checklist", type=lambda value: load_json_string_list_arg(value, "--checklist"))
+    quick.add_argument("--success-criteria", type=lambda value: load_json_string_list_arg(value, "--success-criteria"))
+    quick.add_argument("--no-artifact-expected", action="store_true")
+    quick.add_argument("--resume-start", action="store_true")
+
     for name in ("progress", "wait", "verify", "complete", "fail", "visible-update", "wait-reminder-sent", "report-sent", "abandon"):
         cmd = sub.add_parser(name)
         add_common_event_args(cmd)
@@ -753,10 +1432,37 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--cooldown-seconds", type=int, default=30 * 60)
     scan.add_argument("--record-wake", action="store_true", help="Deprecated no-op; record wake only after delivery with wake-delivered")
 
+    orphans = sub.add_parser("orphans", help="Read-only reconciliation check for active OpenClaw tasks not referenced by active ledger entries")
+    orphans.add_argument("--include-cron", action="store_true", help="Include cron tasks in orphan reconciliation")
+    orphans.add_argument("--min-age-seconds", type=int, default=DEFAULT_ORPHAN_MIN_AGE_SECONDS, help="Only report active tasks at least this old; use 0 for all")
+
+    orphan_warning = sub.add_parser("orphan-warning-sent", help="Suppress repeat warnings for a reported orphan fingerprint")
+    orphan_warning.add_argument("--orphan-fingerprint", required=True)
+    orphan_warning.add_argument("--orphan-fingerprints", help="JSON array of equivalent orphan fingerprints to suppress together")
+    orphan_warning.add_argument("--visible-delivery", required=True)
+    orphan_warning.add_argument("--delivery-message-id", required=True)
+    orphan_warning.add_argument("--note")
+
+    orphan_handled = sub.add_parser("orphan-handled", help="Suppress a reconciled orphan that required no user-visible message")
+    orphan_handled.add_argument("--orphan-fingerprint", required=True)
+    orphan_handled.add_argument("--orphan-fingerprints", help="JSON array of equivalent orphan fingerprints to suppress together")
+    orphan_handled.add_argument("--resolution", required=True, choices=sorted(ORPHAN_HANDLED_RESOLUTIONS))
+    orphan_handled.add_argument("--note", required=True)
+
     wake = sub.add_parser("wake-delivered")
     wake.add_argument("--work-id", required=True)
     wake.add_argument("--recovery-fingerprint", required=True)
     wake.add_argument("--note")
+
+    hook_observe = sub.add_parser("hook-observe")
+    hook_observe.add_argument("--work-id", required=True)
+    hook_observe.add_argument("--payload", required=True, help="Hook payload JSON object")
+    hook_observe.add_argument("--note")
+    hook_observe.add_argument("--next-recovery-action")
+
+    hook_guardrail = sub.add_parser("hook-guardrail")
+    hook_guardrail.add_argument("--work-id", required=True)
+    hook_guardrail.add_argument("--payload", required=True, help="Hook payload JSON object")
 
     sub.add_parser("rebuild")
     return parser
@@ -784,6 +1490,40 @@ def main() -> int:
     if args.command == "scan":
         packets = scan_recoveries(root, args.cooldown_seconds)
         print(json.dumps({"ok": True, "has_recoveries": bool(packets), "recoveries": packets}, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.command == "orphans":
+        min_age_seconds = validate_positive_int(args.min_age_seconds, "--min-age-seconds") if args.min_age_seconds else 0
+        print(json.dumps(find_orphan_active_work(root, include_cron=args.include_cron, min_age_seconds=min_age_seconds), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.command == "orphan-warning-sent":
+        item = record_orphan_warning(
+            root,
+            args.orphan_fingerprint,
+            visible_delivery=load_json_object_arg(args.visible_delivery, "--visible-delivery", required=True),
+            delivery_message_id=args.delivery_message_id,
+            note=args.note,
+            orphan_fingerprints=load_optional_json_string_list_arg(args.orphan_fingerprints, "--orphan-fingerprints"),
+        )
+        print(json.dumps({"ok": True, "warning": item}, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.command == "orphan-handled":
+        item = record_orphan_handled(
+            root,
+            args.orphan_fingerprint,
+            resolution=args.resolution,
+            note=args.note,
+            orphan_fingerprints=load_optional_json_string_list_arg(args.orphan_fingerprints, "--orphan-fingerprints"),
+        )
+        print(json.dumps({"ok": True, "handled": item}, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.command == "quick-start":
+        print(json.dumps(command_quick_start(root, args), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.command == "hook-observe":
+        print(json.dumps(command_hook_observe(root, args), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.command == "hook-guardrail":
+        print(json.dumps(command_hook_guardrail(root, args), ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     if args.command == "wake-delivered":
         validate_work_id(args.work_id)

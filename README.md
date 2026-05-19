@@ -77,14 +77,19 @@ If `~/.openclaw/bin` is on your PATH, the shorter `openclaw-ledger` command work
 ## Repository Layout
 
 - src/work_ledger.py - CLI implementation.
+- src/hook_event_contract.py - hook observation/guardrail classifier used by Ledger recovery safety checks.
 - tests/smoke/work_ledger_smoke.py - behavior smoke tests.
+- tests/smoke/work_ledger_hook_smoke.py and tests/smoke/hook_* - hook contract and guardrail smoke tests.
 - docs/ledger.md - current behavior, recovery policy, and command reference.
 
 ## Local Tests
 
 ~~~bash
-python3 -m py_compile src/work_ledger.py tests/smoke/work_ledger_smoke.py
+python3 -m py_compile src/hook_event_contract.py src/work_ledger.py tests/smoke/work_ledger_smoke.py tests/smoke/work_ledger_hook_smoke.py tests/smoke/hook_event_contract_smoke.py tests/smoke/hook_action_classifier_golden_smoke.py
 python3 tests/smoke/work_ledger_smoke.py
+python3 tests/smoke/work_ledger_hook_smoke.py
+python3 tests/smoke/hook_event_contract_smoke.py
+python3 tests/smoke/hook_action_classifier_golden_smoke.py
 ~~~
 
 ## License

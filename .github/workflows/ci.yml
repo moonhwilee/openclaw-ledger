@@ -14,5 +14,8 @@ jobs:
           python-version: "3.11"
       - name: Run smoke tests
         run: |
-          python3 -m py_compile src/work_ledger.py tests/smoke/work_ledger_smoke.py
+          python3 -m py_compile src/hook_event_contract.py src/work_ledger.py tests/smoke/work_ledger_smoke.py tests/smoke/work_ledger_hook_smoke.py tests/smoke/hook_event_contract_smoke.py tests/smoke/hook_action_classifier_golden_smoke.py
           python3 tests/smoke/work_ledger_smoke.py
+          python3 tests/smoke/work_ledger_hook_smoke.py
+          python3 tests/smoke/hook_event_contract_smoke.py
+          python3 tests/smoke/hook_action_classifier_golden_smoke.py
