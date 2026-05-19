@@ -80,6 +80,13 @@ def has_delivery_id(payload: dict[str, Any]) -> bool:
 def expected_report_proof(case: dict[str, Any]) -> str | None:
     if hook_event(case["payload"]) != "message:sent":
         return None
+    if case.get("ledger_report_proof_target") == "runtime_pending_send_required":
+        state = case.get("state") or {}
+        pending = state.get("pending_completion_report_send") or {}
+        payload = case["payload"]
+        has_owner_session = payload.get("session_key") == state.get("owner_session_key") or payload.get("sessionKey") == state.get("owner_session_key") or payload.get("session_id") == state.get("owner_session_key")
+        has_pending = bool(pending)
+        return "runtime_pending_send_required" if has_pending and has_owner_session and delivered_route_matches(payload, state) else "ignore"
     return "record" if delivered_route_matches(case["payload"], case.get("state") or {}) else "ignore"
 
 

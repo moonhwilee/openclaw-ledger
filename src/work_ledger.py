@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from hook_event_contract import ledger_guardrail, ledger_observation
+from hook_event_contract import ledger_guardrail, ledger_observation, ledger_required_visible_report_attempt
 
 
 SCHEMA_VERSION = 1
@@ -43,6 +43,7 @@ ROUTE_PROOF_KEYS = {
     "delivery_message_id",
 }
 VISIBLE_DELIVERY_ROUTE_KEYS = {"session_key", "sessionKey", "channel", "target", "to", "accountId", "threadId"}
+PENDING_COMPLETION_REPORT_PROOF_WINDOW_SECONDS = 5 * 60
 ACTIVE_STATUS_EVENT_TRANSITIONS = {
     "wait": "__wait_status__",
     "verify": "verifying",
@@ -101,6 +102,12 @@ DEFAULT_ORPHAN_WARNING_SUPPRESSION_SECONDS = 24 * 60 * 60
 ORPHAN_HANDLED_RESOLUTIONS = {
     "terminal_no_action",
     "referenced_after_refresh",
+}
+TERMINAL_REF_HANDLED_RESOLUTIONS = {
+    "integrated",
+    "superseded",
+    "terminal_no_action",
+    "reported_failure",
 }
 MIN_STALE_AFTER_SECONDS = {
     "running": 5 * 60,
@@ -197,13 +204,21 @@ def load_json_object_arg(value: str | None, name: str, *, required: bool = False
     return parsed
 
 
-def validate_visible_delivery(value: dict[str, Any] | None, name: str, *, required: bool = False) -> dict[str, Any] | None:
+def validate_visible_delivery(
+    value: dict[str, Any] | None,
+    name: str,
+    *,
+    required: bool = False,
+    require_channel_target: bool = False,
+) -> dict[str, Any] | None:
     if value is None:
         if required:
             raise SystemExit(f"{name} is required")
         return None
     has_session = isinstance(value.get("session_key") or value.get("sessionKey"), str)
     has_channel_target = isinstance(value.get("channel"), str) and isinstance(value.get("target") or value.get("to"), str)
+    if require_channel_target and not has_channel_target:
+        raise SystemExit(f"{name} must include channel plus target/to")
     if not (has_session or has_channel_target):
         raise SystemExit(f"{name} must include session_key/sessionKey or channel plus target/to")
     return value
@@ -251,6 +266,90 @@ def assert_visible_delivery_matches_existing(existing: dict[str, Any], reported:
             raise SystemExit(f"report-sent visible_delivery missing original route key: {key}")
         if reported_value != expected_value:
             raise SystemExit(f"report-sent visible_delivery route mismatch for {key}")
+
+
+def delivery_message_id_from_payload(payload: dict[str, Any]) -> str | None:
+    for key in ("delivery_message_id", "message_id", "messageId"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, int):
+            return str(value)
+    return None
+
+
+def delivery_route_without_session(value: dict[str, Any]) -> dict[str, Any]:
+    route = canonical_visible_delivery_route(value)
+    route.pop("session_key", None)
+    return route
+
+
+def payload_session_matches_owner(payload: dict[str, Any], owner_session: Any) -> bool:
+    payload_session = payload.get("session_key") or payload.get("sessionKey") or payload.get("session_id")
+    return bool(payload_session) and payload_session == owner_session
+
+
+def pending_completion_report_send_event(work_id: str, payload: dict[str, Any], state: dict[str, Any], observation: dict[str, Any]) -> dict[str, Any] | None:
+    if not ledger_required_visible_report_attempt(payload, state):
+        return None
+    expected = canonical_visible_delivery_route(
+        state.get("completion_visible_delivery") or state.get("visible_delivery") or {}
+    )
+    if not expected:
+        return None
+    return {
+        "event_type": "hook_observed",
+        "work_id": work_id,
+        "note": "Observed allowed visible completion report send attempt.",
+        "hook_observations": [observation],
+        "hook_fingerprints": [observation["fingerprint"]],
+        "pending_completion_report_send": {
+            "route": expected,
+            "fingerprint": observation["fingerprint"],
+            "delivery_fingerprint": observation.get("delivery_fingerprint"),
+            "tool_use_id": payload.get("tool_use_id"),
+        },
+    }
+
+
+def report_sent_event_from_message_sent(work_id: str, payload: dict[str, Any], state: dict[str, Any], observation: dict[str, Any]) -> dict[str, Any] | None:
+    if payload.get("type") != "message" or payload.get("action") != "sent":
+        return None
+    if state.get("status") not in UNREPORTED_TERMINAL_STATES or state.get("completion_report_sent"):
+        return None
+    pending = state.get("pending_completion_report_send")
+    if not isinstance(pending, dict):
+        return None
+    pending_tool_use_id = pending.get("tool_use_id")
+    payload_tool_use_id = payload.get("tool_use_id")
+    pending_at = parse_time(pending.get("observed_at"))
+    if not pending_at or time.time() - pending_at > PENDING_COMPLETION_REPORT_PROOF_WINDOW_SECONDS:
+        return None
+    if pending_tool_use_id and payload_tool_use_id and payload_tool_use_id != pending_tool_use_id:
+        return None
+    delivery_message_id = delivery_message_id_from_payload(payload)
+    if not delivery_message_id:
+        return None
+    expected = canonical_visible_delivery_route(
+        state.get("completion_visible_delivery") or state.get("visible_delivery") or {}
+    )
+    if not expected:
+        return None
+    if not payload_session_matches_owner(payload, state.get("owner_session_key")):
+        return None
+    delivered = delivery_route_without_session(payload)
+    expected_delivery = {key: value for key, value in expected.items() if key != "session_key"}
+    if delivered != expected_delivery:
+        return None
+    return {
+        "event_type": "report_sent",
+        "work_id": work_id,
+        "note": "Visible completion report delivery proof observed from message:sent telemetry.",
+        "visible_delivery": expected,
+        "delivery_message_id": delivery_message_id,
+        "hook_observations": [observation],
+        "hook_fingerprints": [observation["fingerprint"]],
+    }
 
 
 def validate_owner_session_key(value: str | None) -> str:
@@ -402,6 +501,7 @@ def derive_state(work_id: str, events: list[dict[str, Any]]) -> dict[str, Any]:
         "last_wait_reminder_at": None,
         "terminal_unreported_event": None,
         "terminal_unreported_next_recovery_action": None,
+        "pending_completion_report_send": None,
         "last_activity_at": None,
         "stale_after_seconds": None,
         "created_at": None,
@@ -450,6 +550,10 @@ def derive_state(work_id: str, events: list[dict[str, Any]]) -> dict[str, Any]:
             state["success_criteria"] = event["success_criteria"]
         if event.get("verification"):
             state["verification"] = event["verification"]
+        if event.get("pending_completion_report_send"):
+            pending = dict(event["pending_completion_report_send"])
+            pending.setdefault("observed_at", event.get("event_at"))
+            state["pending_completion_report_send"] = pending
         if event.get("visible_delivery"):
             if event_type == "start":
                 state["visible_delivery"] = {**state.get("visible_delivery", {}), **event["visible_delivery"]}
@@ -557,6 +661,10 @@ def orphan_warnings_path(root: Path) -> Path:
     return ledger_dir(root) / "orphan_warnings.json"
 
 
+def terminal_ref_handled_path(root: Path) -> Path:
+    return ledger_dir(root) / "terminal_ref_handled.json"
+
+
 def load_orphan_warnings(root: Path) -> dict[str, Any]:
     path = orphan_warnings_path(root)
     if not path.exists():
@@ -566,6 +674,107 @@ def load_orphan_warnings(root: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def load_terminal_ref_handled(root: Path) -> dict[str, Any]:
+    path = terminal_ref_handled_path(root)
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def terminal_ref_fingerprint_payload(
+    work_id: str,
+    ref: str,
+    terminal_status: str,
+    *,
+    task: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    payload = {
+        "work_id": work_id,
+        "ref": ref,
+        "terminal_status": terminal_status,
+    }
+    if task:
+        for key in ("taskId", "runId", "endedAt", "terminalOutcome", "terminalSummary"):
+            value = task.get(key)
+            if value is not None:
+                payload[key] = str(value)
+    return payload
+
+
+def terminal_ref_fingerprint(work_id: str, ref: str, terminal_status: str, *, task: dict[str, Any] | None = None) -> str:
+    payload = terminal_ref_fingerprint_payload(work_id, ref, terminal_status, task=task)
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def normalize_terminal_ref_fingerprints(primary: str, aliases: list[str] | None = None) -> list[str]:
+    values = [primary]
+    if aliases:
+        values.extend(aliases)
+    normalized: list[str] = []
+    for value in values:
+        if not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value):
+            raise SystemExit("invalid terminal ref fingerprint")
+        if value not in normalized:
+            normalized.append(value)
+    return normalized
+
+
+def terminal_ref_handled_is_valid(item: dict[str, Any]) -> bool:
+    note = item.get("note")
+    return (
+        bool(item.get("handled_at"))
+        and item.get("resolution") in TERMINAL_REF_HANDLED_RESOLUTIONS
+        and isinstance(note, str)
+        and bool(note.strip())
+    )
+
+
+def record_terminal_ref_handled(
+    root: Path,
+    *,
+    work_id: str,
+    ref: str,
+    terminal_status: str,
+    resolution: str,
+    note: str | None = None,
+    terminal_ref_fingerprints: list[str] | None = None,
+) -> dict[str, Any]:
+    if not WORK_ID_RE.fullmatch(work_id):
+        raise SystemExit("invalid work_id")
+    if not ref:
+        raise SystemExit("--ref is required")
+    if not terminal_status:
+        raise SystemExit("--terminal-status is required")
+    if resolution not in TERMINAL_REF_HANDLED_RESOLUTIONS:
+        allowed = ", ".join(sorted(TERMINAL_REF_HANDLED_RESOLUTIONS))
+        raise SystemExit(f"--resolution must be one of: {allowed}")
+    if not note:
+        raise SystemExit("--note is required")
+    primary = terminal_ref_fingerprint(work_id, ref, terminal_status)
+    fingerprints = normalize_terminal_ref_fingerprints(primary, terminal_ref_fingerprints)
+    with file_lock(root):
+        handled = load_terminal_ref_handled(root)
+        item = {
+            "handled_at": now_iso(),
+            "terminal_ref_fingerprint": primary,
+            "work_id": work_id,
+            "ref": ref,
+            "terminal_status": terminal_status,
+            "resolution": resolution,
+            "note": note,
+        }
+        if len(fingerprints) > 1:
+            item["terminal_ref_fingerprints"] = fingerprints
+        for fingerprint in fingerprints:
+            handled[fingerprint] = dict(item, terminal_ref_fingerprint=fingerprint)
+        atomic_write_json(terminal_ref_handled_path(root), handled)
+    return item
 
 
 def record_orphan_warning(
@@ -711,6 +920,7 @@ def recovery_context_gaps(state: dict[str, Any]) -> list[str]:
         bool(state.get("artifact_paths"))
         or bool(state.get("openclaw_task_ids"))
         or bool(state.get("subagent_session_keys"))
+        or bool(state.get("subagents"))
         or bool(state.get("no_artifact_expected"))
     )
     if not has_recovery_anchor:
@@ -840,6 +1050,10 @@ def normalized_task_identity_values(value: str) -> set[str]:
     return values
 
 
+def is_bare_uuid(value: Any) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", value))
+
+
 def task_identity_values(task: dict[str, Any]) -> set[str]:
     values: set[str] = set()
     for key in ("taskId", "runId", "childSessionKey", "sessionKey", "agent_id", "agentId"):
@@ -927,11 +1141,172 @@ def collect_active_task_refs(root: Path) -> set[str]:
         for subagent in state.get("subagents", []):
             if not isinstance(subagent, dict):
                 continue
-            for key in ("taskId", "runId", "sessionKey", "childSessionKey", "agent_id", "agentId"):
+            for key in ("id", "taskId", "runId", "sessionKey", "childSessionKey", "agent_id", "agentId"):
                 value = subagent.get(key)
                 if isinstance(value, str) and value:
                     refs.update(normalized_task_identity_values(value))
     return refs
+
+
+def collect_active_task_ref_details(root: Path) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for state in load_states(root):
+        if state.get("status") not in ACTIVE_STATES:
+            continue
+        for key in ("openclaw_task_ids", "subagent_session_keys"):
+            for value in state.get(key, []):
+                if not isinstance(value, str) or not value:
+                    continue
+                for normalized in normalized_task_identity_values(value):
+                    marker = (str(state.get("work_id") or ""), normalized)
+                    if marker in seen:
+                        continue
+                    seen.add(marker)
+                    refs.append({"work_id": state.get("work_id"), "status": state.get("status"), "ref": normalized, "raw_ref": value, "source": key})
+        for subagent in state.get("subagents", []):
+            if not isinstance(subagent, dict):
+                continue
+            for key in ("id", "taskId", "runId", "sessionKey", "childSessionKey", "agent_id", "agentId"):
+                value = subagent.get(key)
+                if not isinstance(value, str) or not value:
+                    continue
+                for normalized in normalized_task_identity_values(value):
+                    marker = (str(state.get("work_id") or ""), normalized)
+                    if marker in seen:
+                        continue
+                    seen.add(marker)
+                    refs.append({
+                        "work_id": state.get("work_id"),
+                        "status": state.get("status"),
+                        "ref": normalized,
+                        "raw_ref": value,
+                        "source": f"subagents.{key}",
+                        "subagent": {k: v for k, v in subagent.items() if k in {"id", "role", "taskId", "runId", "sessionKey", "childSessionKey", "agent_id", "agentId"}},
+                    })
+    return refs
+
+
+def load_openclaw_task_lookup(lookup: str) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        proc = subprocess.run(
+            ["openclaw", "tasks", "show", "--json", lookup],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, str(exc)
+    if proc.returncode != 0:
+        text = (proc.stderr or proc.stdout or f"openclaw tasks show exited {proc.returncode}").strip()
+        lowered = text.lower()
+        if "not found" in lowered or "no task" in lowered:
+            return {"status": "notFound", "lookup": lookup}, None
+        return None, text
+    output = proc.stdout.strip() or proc.stderr.strip()
+    try:
+        parsed = json.loads(output)
+    except json.JSONDecodeError as exc:
+        return None, f"invalid task JSON for {lookup}: {exc}"
+    if isinstance(parsed, dict) and isinstance(parsed.get("task"), dict):
+        return parsed["task"], None
+    if isinstance(parsed, dict):
+        return parsed, None
+    return None, f"unexpected task JSON for {lookup}"
+
+
+def normalized_openclaw_task_status(task: dict[str, Any]) -> str | None:
+    status = task.get("status")
+    if isinstance(status, str):
+        return status
+    if isinstance(status, dict):
+        for key in ("completed", "errored"):
+            if key in status:
+                return key
+    return None
+
+
+def find_referenced_terminal_tasks(root: Path) -> dict[str, Any]:
+    terminal_statuses = {
+        "succeeded",
+        "failed",
+        "timed_out",
+        "cancelled",
+        "lost",
+        "shutdown",
+        "notFound",
+        "not_found",
+        "completed",
+        "errored",
+    }
+    terminal_refs: list[dict[str, Any]] = []
+    ignored: list[dict[str, Any]] = []
+    errors: list[str] = []
+    lookup_results: dict[str, tuple[dict[str, Any] | None, str | None]] = {}
+    handled = load_terminal_ref_handled(root)
+    for ref in collect_active_task_ref_details(root):
+        lookup = ref.get("ref")
+        if not isinstance(lookup, str) or not lookup:
+            continue
+        raw_ref = ref.get("raw_ref")
+        source = str(ref.get("source") or "")
+        if lookup.startswith("codex-thread:") or (isinstance(raw_ref, str) and raw_ref.startswith("codex-thread:")):
+            continue
+        if (
+            source in {"subagents.id", "subagents.agent_id", "subagents.agentId", "subagent_session_keys"}
+            and is_bare_uuid(raw_ref)
+        ):
+            continue
+        if lookup not in lookup_results:
+            lookup_results[lookup] = load_openclaw_task_lookup(lookup)
+        task, error = lookup_results[lookup]
+        if error:
+            errors.append(f"{lookup}: {error}")
+            continue
+        if not task:
+            continue
+        status = normalized_openclaw_task_status(task)
+        if status in terminal_statuses:
+            item = {
+                **ref,
+                "taskId": task.get("taskId"),
+                "runId": task.get("runId"),
+                "runtime": task.get("runtime"),
+                "task_status": status,
+                "label": task.get("label"),
+                "terminalSummary": task.get("terminalSummary"),
+                "terminalOutcome": task.get("terminalOutcome"),
+                "progressSummary": task.get("progressSummary"),
+                "endedAt": task.get("endedAt"),
+            }
+            work_id = str(item.get("work_id") or "")
+            ref_value = str(item.get("ref") or "")
+            fingerprint = terminal_ref_fingerprint(work_id, ref_value, status, task=task)
+            legacy_fingerprint = terminal_ref_fingerprint(work_id, ref_value, status)
+            item["terminal_ref_fingerprint"] = fingerprint
+            item["terminal_ref_fingerprints"] = normalize_terminal_ref_fingerprints(fingerprint, [legacy_fingerprint])
+            handled_item = next(
+                (
+                    handled.get(alias)
+                    for alias in item["terminal_ref_fingerprints"]
+                    if isinstance(handled.get(alias), dict) and terminal_ref_handled_is_valid(handled.get(alias, {}))
+                ),
+                None,
+            )
+            if isinstance(handled_item, dict):
+                ignored.append({**item, "reason": "handled", "handled": handled_item})
+                continue
+            terminal_refs.append(item)
+    return {
+        "ok": not errors,
+        "has_terminal_refs": bool(terminal_refs),
+        "terminal_refs": terminal_refs,
+        "ignored": ignored,
+        "errors": errors,
+        "checked_refs": len(lookup_results),
+        "policy": "terminal referenced tasks require LLM reconciliation only; do not restart or repeat side effects from this signal alone",
+    }
 
 
 def load_openclaw_tasks(status: str) -> tuple[list[dict[str, Any]], str | None]:
@@ -1100,6 +1475,91 @@ def find_orphan_active_work(root: Path, *, include_cron: bool = False, min_age_s
     }
 
 
+def watchdog_check(
+    root: Path,
+    *,
+    include_cron: bool = False,
+    min_age_seconds: int = DEFAULT_ORPHAN_MIN_AGE_SECONDS,
+    cooldown_seconds: int = 30 * 60,
+) -> dict[str, Any]:
+    terminal_refs = find_referenced_terminal_tasks(root)
+    if not terminal_refs.get("ok", False):
+        return {
+            "ok": False,
+            "status": "error",
+            "needs_wake": True,
+            "wake_reason": "runner_error",
+            "recoveries": [],
+            "terminal_refs": terminal_refs,
+            "orphans": None,
+            "errors": terminal_refs.get("errors", []),
+            "policy": "LLM should inspect runner errors before user-visible output; do not retry risky side effects",
+        }
+    if terminal_refs.get("has_terminal_refs"):
+        return {
+            "ok": True,
+            "status": "needs_wake",
+            "needs_wake": True,
+            "wake_reason": "referenced_task_reconciliation",
+            "recoveries": [],
+            "terminal_refs": terminal_refs,
+            "orphans": None,
+            "policy": "LLM must reconcile referenced terminal tasks by integrating results or reporting failure; do not restart or repeat side effects from this signal alone",
+        }
+
+    recoveries = scan_recoveries(root, cooldown_seconds)
+    if recoveries:
+        return {
+            "ok": True,
+            "status": "needs_wake",
+            "needs_wake": True,
+            "wake_reason": "recovery",
+            "recoveries": recoveries,
+            "terminal_refs": terminal_refs,
+            "orphans": None,
+            "policy": "LLM must reconcile recovery packet before visible report; do not retry risky side effects from watchdog output alone",
+        }
+
+    orphan_result = find_orphan_active_work(root, include_cron=include_cron, min_age_seconds=min_age_seconds)
+    if not orphan_result.get("ok", False):
+        return {
+            "ok": False,
+            "status": "error",
+            "needs_wake": True,
+            "wake_reason": "runner_error",
+            "recoveries": [],
+            "orphans": orphan_result,
+            "errors": orphan_result.get("errors", []),
+            "policy": "LLM should inspect runner errors before user-visible output; do not retry risky side effects",
+        }
+    if orphan_result.get("has_orphans"):
+        return {
+            "ok": True,
+            "status": "needs_wake",
+            "needs_wake": True,
+            "wake_reason": "orphan_reconciliation",
+            "recoveries": [],
+            "orphans": orphan_result,
+            "policy": "LLM must refresh/reconcile orphans before any user-visible warning; at most one aggregated result message",
+        }
+    handled_orphans = [
+        item
+        for item in orphan_result.get("ignored", [])
+        if isinstance(item, dict) and item.get("reason") == "handled"
+    ]
+    return {
+        "ok": True,
+        "status": "clean",
+        "needs_wake": False,
+        "wake_reason": None,
+        "recoveries": [],
+        "terminal_refs": terminal_refs,
+        "orphans": orphan_result,
+        "handled_orphans": handled_orphans,
+        "policy": "clean/no-op path; no visible user message needed",
+    }
+
+
 QUICK_START_PRESETS: dict[str, dict[str, Any]] = {
     "coding": {
         "side_effect_class": "repo_changes",
@@ -1172,6 +1632,7 @@ def command_quick_start(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         load_json_object_arg(args.visible_delivery, "--visible-delivery", required=True),
         "--visible-delivery",
         required=True,
+        require_channel_target=True,
     )
     side_effect_class = args.side_effect_class or preset["side_effect_class"]
     repeat_policy = args.repeat_policy or preset["repeat_policy"]
@@ -1220,7 +1681,12 @@ def validate_start(args: argparse.Namespace) -> None:
     if not args.request_summary:
         raise SystemExit("--request-summary is required")
     validate_owner_session_key(args.owner_session_key)
-    validate_visible_delivery(load_json_object_arg(args.visible_delivery, "--visible-delivery", required=True), "--visible-delivery", required=True)
+    validate_visible_delivery(
+        load_json_object_arg(args.visible_delivery, "--visible-delivery", required=True),
+        "--visible-delivery",
+        required=True,
+        require_channel_target=True,
+    )
     load_json_string_list_arg(args.checklist, "--checklist")
     load_json_string_list_arg(args.success_criteria, "--success-criteria")
     if args.side_effect_class in {"external_message", "public_post", "destructive", "gateway_runtime"} and not args.idempotency_key:
@@ -1242,6 +1708,7 @@ def command_event(root: Path, args: argparse.Namespace, event_type: str) -> dict
             load_json_object_arg(getattr(args, "visible_delivery", None), "--visible-delivery", required=True),
             "--visible-delivery",
             required=True,
+            require_channel_target=True,
         )
         if not getattr(args, "delivery_message_id", None):
             raise SystemExit("--delivery-message-id is required for report-sent")
@@ -1317,6 +1784,25 @@ def command_hook_observe(root: Path, args: argparse.Namespace) -> dict[str, Any]
         state = derive_state(args.work_id, existing)
         if fingerprint in state.get("hook_fingerprints", []):
             return {"ok": True, "duplicate": True, "observation": observation}
+        pending_event = pending_completion_report_send_event(args.work_id, payload, state, observation)
+        if pending_event:
+            return {
+                "ok": True,
+                "duplicate": False,
+                "event": append_event_unlocked(root, pending_event),
+                "observation": observation,
+                "recorded_completion_report_send": True,
+            }
+        report_event = report_sent_event_from_message_sent(args.work_id, payload, state, observation)
+        if report_event:
+            assert_visible_delivery_matches_existing(state, report_event.get("visible_delivery") or {})
+            return {
+                "ok": True,
+                "duplicate": False,
+                "event": append_event_unlocked(root, report_event),
+                "observation": observation,
+                "recorded_report_sent": True,
+            }
         event: dict[str, Any] = {
             "event_type": "hook_observed",
             "work_id": args.work_id,
@@ -1436,6 +1922,11 @@ def build_parser() -> argparse.ArgumentParser:
     orphans.add_argument("--include-cron", action="store_true", help="Include cron tasks in orphan reconciliation")
     orphans.add_argument("--min-age-seconds", type=int, default=DEFAULT_ORPHAN_MIN_AGE_SECONDS, help="Only report active tasks at least this old; use 0 for all")
 
+    watchdog = sub.add_parser("watchdog-check", help="Fast deterministic watchdog triage; clean exits need no LLM")
+    watchdog.add_argument("--include-cron", action="store_true", help="Include cron tasks in orphan reconciliation")
+    watchdog.add_argument("--min-age-seconds", type=int, default=DEFAULT_ORPHAN_MIN_AGE_SECONDS, help="Only report active tasks at least this old; use 0 for all")
+    watchdog.add_argument("--cooldown-seconds", type=int, default=30 * 60, help="Recovery packet cooldown")
+
     orphan_warning = sub.add_parser("orphan-warning-sent", help="Suppress repeat warnings for a reported orphan fingerprint")
     orphan_warning.add_argument("--orphan-fingerprint", required=True)
     orphan_warning.add_argument("--orphan-fingerprints", help="JSON array of equivalent orphan fingerprints to suppress together")
@@ -1448,6 +1939,14 @@ def build_parser() -> argparse.ArgumentParser:
     orphan_handled.add_argument("--orphan-fingerprints", help="JSON array of equivalent orphan fingerprints to suppress together")
     orphan_handled.add_argument("--resolution", required=True, choices=sorted(ORPHAN_HANDLED_RESOLUTIONS))
     orphan_handled.add_argument("--note", required=True)
+
+    terminal_ref_handled = sub.add_parser("terminal-ref-handled", help="Suppress a reconciled terminal task/subagent reference without completing the work")
+    terminal_ref_handled.add_argument("--work-id", required=True)
+    terminal_ref_handled.add_argument("--ref", required=True)
+    terminal_ref_handled.add_argument("--terminal-status", required=True)
+    terminal_ref_handled.add_argument("--resolution", required=True, choices=sorted(TERMINAL_REF_HANDLED_RESOLUTIONS))
+    terminal_ref_handled.add_argument("--terminal-ref-fingerprints", help="JSON array of equivalent terminal ref fingerprints to suppress together")
+    terminal_ref_handled.add_argument("--note", required=True)
 
     wake = sub.add_parser("wake-delivered")
     wake.add_argument("--work-id", required=True)
@@ -1495,6 +1994,11 @@ def main() -> int:
         min_age_seconds = validate_positive_int(args.min_age_seconds, "--min-age-seconds") if args.min_age_seconds else 0
         print(json.dumps(find_orphan_active_work(root, include_cron=args.include_cron, min_age_seconds=min_age_seconds), ensure_ascii=False, indent=2, sort_keys=True))
         return 0
+    if args.command == "watchdog-check":
+        min_age_seconds = validate_positive_int(args.min_age_seconds, "--min-age-seconds") if args.min_age_seconds else 0
+        cooldown_seconds = validate_positive_int(args.cooldown_seconds, "--cooldown-seconds") if args.cooldown_seconds else 0
+        print(json.dumps(watchdog_check(root, include_cron=args.include_cron, min_age_seconds=min_age_seconds, cooldown_seconds=cooldown_seconds), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
     if args.command == "orphan-warning-sent":
         item = record_orphan_warning(
             root,
@@ -1513,6 +2017,18 @@ def main() -> int:
             resolution=args.resolution,
             note=args.note,
             orphan_fingerprints=load_optional_json_string_list_arg(args.orphan_fingerprints, "--orphan-fingerprints"),
+        )
+        print(json.dumps({"ok": True, "handled": item}, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.command == "terminal-ref-handled":
+        item = record_terminal_ref_handled(
+            root,
+            work_id=args.work_id,
+            ref=args.ref,
+            terminal_status=args.terminal_status,
+            resolution=args.resolution,
+            note=args.note,
+            terminal_ref_fingerprints=load_optional_json_string_list_arg(args.terminal_ref_fingerprints, "--terminal-ref-fingerprints"),
         )
         print(json.dumps({"ok": True, "handled": item}, ensure_ascii=False, indent=2, sort_keys=True))
         return 0

@@ -385,13 +385,22 @@
         "action": "sent",
         "channel": "telegram",
         "target": "test-user",
+        "sessionKey": "agent:main:telegram:direct:test-user",
         "messageId": "visible-report-1"
       },
       "state": {
         "status": "completed_unreported",
+        "owner_session_key": "agent:main:telegram:direct:test-user",
         "visible_delivery": {
           "channel": "telegram",
           "target": "test-user"
+        },
+        "pending_completion_report_send": {
+          "route": {
+            "channel": "telegram",
+            "target": "test-user"
+          },
+          "observed_at": "runtime-fresh"
         }
       },
       "action_class": "external_message",
@@ -402,8 +411,8 @@
       "requires_user_approval_candidate": false,
       "ledger_target_decision": "allow",
       "goalflow_target_decision": "allow",
-      "ledger_report_proof_target": "record",
-      "rationale": "A delivered-message observation is proof telemetry, not a new outbound attempt. Ledger/orchestrator owns report-sent recording.",
+      "ledger_report_proof_target": "runtime_pending_send_required",
+      "rationale": "A delivered-message observation is proof telemetry, not a new outbound attempt. Runtime proof still requires a pending send, owner session, fresh proof window, route match, and delivery id.",
       "classifier_approval_sensitive_candidate": false
     },
     {
