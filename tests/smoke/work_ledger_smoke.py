@@ -81,6 +81,21 @@ def age_events(root: Path, work_id: str, seconds: int) -> None:
             fh.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def age_events_by_type(root: Path, work_id: str, event_types: set[str], seconds: int) -> None:
+    path = root / "state" / "work-ledger" / "events.jsonl"
+    events = []
+    aged = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            event = json.loads(line)
+            if event.get("work_id") == work_id and event.get("event_type") in event_types:
+                event["event_at"] = aged.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            events.append(event)
+    with path.open("w", encoding="utf-8") as fh:
+        for event in events:
+            fh.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+
+
 def age_pending_completion_report_send(root: Path, work_id: str, seconds: int) -> None:
     path = root / "state" / "work-ledger" / "events.jsonl"
     events = []
@@ -94,6 +109,14 @@ def age_pending_completion_report_send(root: Path, work_id: str, seconds: int) -
     with path.open("w", encoding="utf-8") as fh:
         for event in events:
             fh.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def append_raw_event_line(root: Path, line: str) -> None:
+    path = root / "state" / "work-ledger" / "events.jsonl"
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(line)
+        if not line.endswith("\n"):
+            fh.write("\n")
 
 
 def smoke_recovery_report_path() -> dict[str, Any]:
@@ -303,6 +326,24 @@ def smoke_report_sent_requires_delivery() -> dict[str, Any]:
             "--delivery-message-id",
             "extra-route-report",
         )
+        progress_missing_delivery = run_expect_fail(root, "visible-update", "--work-id", work_id)
+        progress_missing_message_id = run_expect_fail(
+            root,
+            "visible-update",
+            "--work-id",
+            work_id,
+            "--visible-delivery",
+            json.dumps({"session_key": "agent:main:telegram:direct:test-user"}),
+        )
+        reminder_missing_delivery = run_expect_fail(root, "wait-reminder-sent", "--work-id", work_id)
+        reminder_missing_message_id = run_expect_fail(
+            root,
+            "wait-reminder-sent",
+            "--work-id",
+            work_id,
+            "--visible-delivery",
+            json.dumps({"channel": "telegram", "target": "test-user"}),
+        )
         state = run(root, "state", "--work-id", work_id)["items"][0]
         assert_true(state["status"] == "completed_unreported", "failed report-sent must not close the work")
         assert_true(
@@ -325,6 +366,22 @@ def smoke_report_sent_requires_delivery() -> dict[str, Any]:
             "route mismatch" in extra_route_key,
             "report-sent should reject extra delivery route keys",
         )
+        assert_true(
+            "--visible-delivery is required" in progress_missing_delivery,
+            "visible-update should require visible_delivery proof",
+        )
+        assert_true(
+            "--delivery-message-id is required" in progress_missing_message_id,
+            "visible-update should require delivery_message_id proof",
+        )
+        assert_true(
+            "--visible-delivery is required" in reminder_missing_delivery,
+            "wait-reminder-sent should require visible_delivery proof",
+        )
+        assert_true(
+            "--delivery-message-id is required" in reminder_missing_message_id,
+            "wait-reminder-sent should require delivery_message_id proof",
+        )
         run(
             root,
             "report-sent",
@@ -345,6 +402,8 @@ def smoke_report_sent_requires_delivery() -> dict[str, Any]:
             "session_only_completion_route_rejected": "channel plus target/to" in session_only_start,
             "wrong_route_rejected": "route mismatch" in wrong_route,
             "extra_route_key_rejected": "route mismatch" in extra_route_key,
+            "progress_delivery_proof_required": "--visible-delivery is required" in progress_missing_delivery,
+            "reminder_delivery_proof_required": "--visible-delivery is required" in reminder_missing_delivery,
             "target_to_alias_accepted": reported_state["status"] == "reported",
         }
 
@@ -729,8 +788,8 @@ def smoke_visible_update_route_does_not_contaminate_report_route() -> dict[str, 
         assert_true(packet["visible_delivery"].get("target") == "test-user", "recovery packet should keep completion route")
         assert_true("session_key" not in packet["visible_delivery"], "recovery packet route should not include progress route")
         assert_true(
-            packet.get("visible_delivery_proof", {}).get("last_update_message_id") == "progress-message",
-            "progress proof should be separate from route",
+            packet.get("visible_delivery_proof", {}).get("last_update_message_id") is None,
+            "non-completion-route progress proof should not be treated as visible proof",
         )
         run(
             root,
@@ -754,7 +813,7 @@ def smoke_visible_update_route_does_not_contaminate_report_route() -> dict[str, 
             "final_status": state["status"],
             "completion_route_target": state["completion_visible_delivery"]["target"],
             "progress_route_isolated": "session_key" not in state.get("visible_delivery", {}),
-            "proof_route_separate": packet.get("visible_delivery_proof", {}).get("last_update_message_id") == "progress-message",
+            "non_completion_route_proof_ignored": packet.get("visible_delivery_proof", {}).get("last_update_message_id") is None,
         }
 
 
@@ -1480,20 +1539,250 @@ def smoke_waiting_user_minimum_stale_after() -> dict[str, Any]:
             json.dumps(["waiting_user minimum prevents early wake"]),
         )
         run(root, "wait", "--work-id", work_id, "--status", "waiting_user", "--note", "waiting for user")
+        state = run(root, "state", "--work-id", work_id)["items"][0]
+        assert_true(
+            state["stale_after_seconds"] == 24 * 60 * 60,
+            "waiting_user should default to one day before becoming stale",
+        )
 
         age_events(root, work_id, seconds=301)
         fresh = run(root, "scan", "--cooldown-seconds", "0")
         assert_true(not fresh["has_recoveries"], "waiting_user should not use a 300s running threshold")
 
         age_events(root, work_id, seconds=3601)
+        still_fresh = run(root, "scan", "--cooldown-seconds", "0")
+        assert_true(not still_fresh["has_recoveries"], "waiting_user should not use the old one-hour minimum")
+
+        age_events(root, work_id, seconds=(24 * 60 * 60) + 1)
         stale = run(root, "scan", "--cooldown-seconds", "0")
-        assert_true(stale["has_recoveries"], "waiting_user should become stale after its minimum")
+        assert_true(stale["has_recoveries"], "waiting_user should become stale after one day")
         packet = stale["recoveries"][0]
         assert_true(packet["reason"].startswith("waiting_user_stale_"), "reason should reflect waiting_user stale state")
+        assert_true(packet["stale_after_seconds"] == 24 * 60 * 60, "packet should expose the waiting_user threshold")
         return {
             "work_id": work_id,
             "early_wake_suppressed": not fresh["has_recoveries"],
+            "one_hour_wake_suppressed": not still_fresh["has_recoveries"],
+            "stale_after_seconds": packet["stale_after_seconds"],
             "reason": packet["reason"],
+        }
+
+
+def smoke_waiting_user_wait_does_not_refresh_activity() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="work-ledger-smoke-") as tmp:
+        root = Path(tmp)
+        work_id = "smoke-waiting-user-silent-wait"
+        visible_delivery = json.dumps({"channel": "telegram", "target": "test-user"})
+
+        run(
+            root,
+            "start",
+            "--work-id",
+            work_id,
+            "--owner-session-key",
+            "agent:main:telegram:direct:test-user",
+            "--visible-delivery",
+            visible_delivery,
+            "--request-summary",
+            "Smoke test waiting_user wait is not visible proof",
+            "--expected-outputs",
+            "owner decision",
+            "--next-recovery-action",
+            "Wait for user decision.",
+            "--side-effect-class",
+            "local_files",
+            "--no-artifact-expected",
+            "--checklist",
+            json.dumps(["start", "wait"]),
+            "--success-criteria",
+            json.dumps(["silent waits do not defer stale recovery"]),
+        )
+        run(root, "wait", "--work-id", work_id, "--status", "waiting_user", "--note", "waiting for user")
+        age_events_by_type(root, work_id, {"start"}, seconds=(24 * 60 * 60) + 1)
+        state = run(root, "state", "--work-id", work_id)["items"][0]
+        assert_true(state["last_activity_at"] == state["created_at"], "silent waiting_user wait must not refresh activity")
+
+        stale = run(root, "scan", "--cooldown-seconds", "0")
+        assert_true(stale["has_recoveries"], "old waiting_user work should recover even after a fresh silent wait")
+        packet = stale["recoveries"][0]
+        assert_true(packet["reason"].startswith("waiting_user_stale_"), "reason should reflect waiting_user stale state")
+
+        run(
+            root,
+            "visible-update",
+            "--work-id",
+            work_id,
+            "--visible-delivery",
+            json.dumps({"channel": "telegram", "target": "other-user"}),
+            "--delivery-message-id",
+            "wrong-visible-update",
+        )
+        wrong_update = run(root, "state", "--work-id", work_id)["items"][0]
+        assert_true(
+            wrong_update["last_activity_at"] == state["last_activity_at"],
+            "visible update for a different route must not refresh waiting_user activity",
+        )
+        assert_true(
+            wrong_update.get("visible_delivery_proof", {}).get("last_update_message_id") is None,
+            "visible update for a different route must not record visible proof",
+        )
+
+        run(
+            root,
+            "progress",
+            "--work-id",
+            work_id,
+            "--note",
+            "silent bookkeeping while still waiting",
+        )
+        progress_state = run(root, "state", "--work-id", work_id)["items"][0]
+        assert_true(
+            progress_state["last_activity_at"] == state["last_activity_at"],
+            "progress while waiting_user must not refresh activity",
+        )
+
+        run(
+            root,
+            "visible-update",
+            "--work-id",
+            work_id,
+            "--visible-delivery",
+            visible_delivery,
+            "--delivery-message-id",
+            "visible-update",
+        )
+        update_refreshed = run(root, "state", "--work-id", work_id)["items"][0]
+        assert_true(
+            update_refreshed["last_visible_update_at"] == update_refreshed["last_activity_at"],
+            "visible update proof should refresh waiting_user activity",
+        )
+
+        run(
+            root,
+            "wait-reminder-sent",
+            "--work-id",
+            work_id,
+            "--visible-delivery",
+            visible_delivery,
+            "--delivery-message-id",
+            "visible-reminder",
+        )
+        refreshed = run(root, "state", "--work-id", work_id)["items"][0]
+        assert_true(
+            refreshed["last_wait_reminder_at"] == refreshed["last_activity_at"],
+            "visible reminder proof should refresh waiting_user activity",
+        )
+        return {
+            "work_id": work_id,
+            "silent_wait_did_not_refresh": state["last_activity_at"] == state["created_at"],
+            "wrong_route_update_did_not_refresh": wrong_update["last_activity_at"] == state["last_activity_at"],
+            "wrong_route_update_proof_ignored": wrong_update.get("visible_delivery_proof", {}).get("last_update_message_id") is None,
+            "progress_did_not_refresh": progress_state["last_activity_at"] == state["last_activity_at"],
+            "visible_update_refreshed": update_refreshed["last_visible_update_at"] == update_refreshed["last_activity_at"],
+            "visible_reminder_refreshed": refreshed["last_wait_reminder_at"] == refreshed["last_activity_at"],
+        }
+
+
+def smoke_prune_terminal_dry_run_and_apply() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="work-ledger-smoke-") as tmp:
+        root = Path(tmp)
+        visible_delivery = json.dumps({"channel": "telegram", "target": "test-user"})
+        old_reported = "smoke-prune-old-reported"
+        old_abandoned = "smoke-prune-old-abandoned"
+        active_waiting = "smoke-prune-active-waiting"
+        recent_reported = "smoke-prune-recent-reported"
+        reused_work = "smoke-prune-reused-work-id"
+
+        for work_id in (old_reported, old_abandoned, active_waiting, recent_reported, reused_work):
+            run(
+                root,
+                "start",
+                "--work-id",
+                work_id,
+                "--owner-session-key",
+                "agent:main:telegram:direct:test-user",
+                "--visible-delivery",
+                visible_delivery,
+                "--request-summary",
+                f"Smoke test prune terminal work {work_id}",
+                "--expected-outputs",
+                "smoke-output",
+                "--side-effect-class",
+                "local_files",
+                "--no-artifact-expected",
+                "--checklist",
+                json.dumps(["start"]),
+                "--success-criteria",
+                json.dumps(["prune respects active and recent work"]),
+            )
+
+        for work_id in (old_reported, recent_reported, reused_work):
+            run(root, "complete", "--work-id", work_id, "--note", "done")
+            run(
+                root,
+                "report-sent",
+                "--work-id",
+                work_id,
+                "--visible-delivery",
+                visible_delivery,
+                "--delivery-message-id",
+                f"{work_id}-report",
+            )
+        run(root, "abandon", "--work-id", old_abandoned, "--note", "superseded")
+        run(root, "wait", "--work-id", active_waiting, "--status", "waiting_user", "--note", "still waiting")
+
+        for work_id in (old_reported, old_abandoned, active_waiting, reused_work):
+            age_events(root, work_id, seconds=31 * 24 * 60 * 60)
+
+        dry_run = run(root, "prune-terminal", "--days", "30")
+        dry_run_ids = {item["work_id"] for item in dry_run["candidates"]}
+        assert_true(dry_run["apply"] is False, "prune-terminal should dry-run by default")
+        assert_true(dry_run_ids == {old_reported, old_abandoned, reused_work}, "dry-run should include only old terminal work")
+        assert_true(len(run(root, "state")["items"]) == 5, "dry-run must not remove state")
+
+        run(
+            root,
+            "start",
+            "--work-id",
+            reused_work,
+            "--owner-session-key",
+            "agent:main:telegram:direct:test-user",
+            "--visible-delivery",
+            visible_delivery,
+            "--request-summary",
+            "Smoke test reused work id after old terminal work",
+            "--expected-outputs",
+            "new-smoke-output",
+            "--side-effect-class",
+            "local_files",
+            "--no-artifact-expected",
+            "--checklist",
+            json.dumps(["restart"]),
+            "--success-criteria",
+            json.dumps(["prune apply recomputes candidates under lock"]),
+        )
+        corrupt_line = "{this is not valid json but should remain"
+        append_raw_event_line(root, corrupt_line)
+
+        applied = run(root, "prune-terminal", "--days", "30", "--apply")
+        remaining_ids = {item["work_id"] for item in run(root, "state")["items"]}
+        assert_true(old_reported not in remaining_ids, "old reported work should be pruned")
+        assert_true(old_abandoned not in remaining_ids, "old abandoned work should be pruned")
+        assert_true(active_waiting in remaining_ids, "active waiting work must not be pruned")
+        assert_true(recent_reported in remaining_ids, "recent reported work must not be pruned")
+        assert_true(reused_work in remaining_ids, "reused active work id must not be pruned from a stale dry-run candidate")
+
+        events_text = (root / "state" / "work-ledger" / "events.jsonl").read_text(encoding="utf-8")
+        assert_true(old_reported not in events_text, "pruned reported events should be removed")
+        assert_true(old_abandoned not in events_text, "pruned abandoned events should be removed")
+        assert_true(active_waiting in events_text, "active work events should remain")
+        assert_true(reused_work in events_text, "reused active work events should remain")
+        assert_true(corrupt_line in events_text, "corrupt raw event lines should be preserved")
+        return {
+            "dry_run_count": dry_run["prune_count"],
+            "applied_count": applied["prune_count"],
+            "remaining_ids": sorted(remaining_ids),
+            "corrupt_line_preserved": corrupt_line in events_text,
         }
 
 
@@ -1828,6 +2117,8 @@ def main() -> int:
             "missing_expected_outputs_context": smoke_missing_expected_outputs_context(),
             "per_entry_stale_after": smoke_per_entry_stale_after(),
             "waiting_user_minimum_stale_after": smoke_waiting_user_minimum_stale_after(),
+            "waiting_user_wait_does_not_refresh_activity": smoke_waiting_user_wait_does_not_refresh_activity(),
+            "prune_terminal_dry_run_and_apply": smoke_prune_terminal_dry_run_and_apply(),
             "gateway_side_effect_idempotency_policy": smoke_gateway_side_effect_idempotency_policy(),
             "resume_start_does_not_hide_unreported_completion": smoke_resume_start_does_not_hide_unreported_completion(),
             "terminal_refs_precede_stale_recovery": smoke_terminal_refs_precede_stale_recovery(),

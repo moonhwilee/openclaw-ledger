@@ -72,6 +72,12 @@ such as `approval_rejected` or `approval_expired`, should also refresh
 `waiting_user` after the visible update so the previous approval wait does not
 look stale or ambiguous.
 
+`waiting_user` is intentionally slower than active work: the default stale
+threshold is one day. A plain `wait --status waiting_user` records state, but it
+does not count as user-visible proof and must not refresh activity by itself.
+Only a `visible-update` or `wait-reminder-sent` with both a visible delivery
+route and delivery message id can refresh the visible-wait clock.
+
 ## Selective Registration Policy
 
 Do not register every user turn. Work Ledger is for work with durable recovery
@@ -244,6 +250,20 @@ ordinary `needs_wake` results. The LaunchAgent watchdog owns recovery wakeups;
 the user should normally see only the reconciled result report. A secondary
 monitor should alert only when the watchdog runner itself repeatedly fails or a
 recovery is blocked on a real user decision.
+
+## Retention
+
+`prune-terminal` removes old terminal work without creating an archive. It is
+dry-run by default:
+
+```bash
+openclaw-ledger prune-terminal --days 30
+openclaw-ledger prune-terminal --days 30 --apply
+```
+
+Only `reported` and `abandoned` work older than the retention window is pruned.
+Active, waiting, verifying, failed-unreported, and completed-unreported work is
+never pruned by this command.
 
 ## Installed Runner
 
