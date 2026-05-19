@@ -6,22 +6,28 @@ INSTALL_DIR="${OPENCLAW_LEDGER_INSTALL_DIR:-$HOME/.openclaw/bin}"
 INSTALL_PATH="$INSTALL_DIR/openclaw-ledger"
 HOOK_PATH="$INSTALL_DIR/hook_event_contract.py"
 STAMP_PATH="$INSTALL_DIR/openclaw-ledger.deploy.json"
+TMP_DIR=""
 
 command -v python3 >/dev/null 2>&1 || {
   echo "python3 is required." >&2
   exit 1
 }
 
-python3 -m py_compile "$ROOT/src/hook_event_contract.py" "$ROOT/src/work_ledger.py"
-
 mkdir -p "$INSTALL_DIR"
-cp "$ROOT/src/work_ledger.py" "$INSTALL_PATH"
-cp "$ROOT/src/hook_event_contract.py" "$HOOK_PATH"
-chmod 755 "$INSTALL_PATH" "$HOOK_PATH"
+TMP_DIR="$(mktemp -d "$INSTALL_DIR/openclaw-ledger-deploy.XXXXXX")"
+trap 'rm -rf "$TMP_DIR"' EXIT
+TMP_LEDGER="$TMP_DIR/openclaw-ledger"
+TMP_HOOK="$TMP_DIR/hook_event_contract.py"
+TMP_STAMP="$TMP_DIR/openclaw-ledger.deploy.json"
 
-"$INSTALL_PATH" --help >/dev/null
+cp "$ROOT/src/work_ledger.py" "$TMP_LEDGER"
+cp "$ROOT/src/hook_event_contract.py" "$TMP_HOOK"
+python3 -m py_compile "$TMP_HOOK" "$TMP_LEDGER"
+chmod 755 "$TMP_LEDGER" "$TMP_HOOK"
 
-python3 - "$ROOT" "$STAMP_PATH" <<'PY'
+"$TMP_LEDGER" --help >/dev/null
+
+python3 - "$ROOT" "$TMP_STAMP" <<'PY'
 import json
 import subprocess
 import sys
@@ -43,6 +49,10 @@ stamp = {
 }
 stamp_path.write_text(json.dumps(stamp, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 PY
+
+mv "$TMP_LEDGER" "$INSTALL_PATH"
+mv "$TMP_HOOK" "$HOOK_PATH"
+mv "$TMP_STAMP" "$STAMP_PATH"
 
 cat <<MSG
 OpenClaw Ledger local deploy complete:
