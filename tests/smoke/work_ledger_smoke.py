@@ -81,6 +81,21 @@ def age_events(root: Path, work_id: str, seconds: int) -> None:
             fh.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def age_pending_completion_report_send(root: Path, work_id: str, seconds: int) -> None:
+    path = root / "state" / "work-ledger" / "events.jsonl"
+    events = []
+    aged = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            event = json.loads(line)
+            if event.get("work_id") == work_id and event.get("pending_completion_report_send"):
+                event["event_at"] = aged.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            events.append(event)
+    with path.open("w", encoding="utf-8") as fh:
+        for event in events:
+            fh.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+
+
 def smoke_recovery_report_path() -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="work-ledger-smoke-") as tmp:
         root = Path(tmp)
@@ -218,6 +233,22 @@ def smoke_report_sent_requires_delivery() -> dict[str, Any]:
         root = Path(tmp)
         work_id = "smoke-report-delivery-required"
         visible_delivery = json.dumps({"channel": "telegram", "target": "telegram:test-user"})
+        session_only_start = run_expect_fail(
+            root,
+            "start",
+            "--work-id",
+            "smoke-session-only-completion-route",
+            "--owner-session-key",
+            "agent:main:telegram:direct:test-user",
+            "--visible-delivery",
+            json.dumps({"session_key": "agent:main:telegram:direct:test-user"}),
+            "--request-summary",
+            "Session-only completion route should be rejected",
+            "--checklist",
+            json.dumps(["start"]),
+            "--success-criteria",
+            json.dumps(["completion route requires channel target"]),
+        )
 
         run(
             root,
@@ -283,6 +314,10 @@ def smoke_report_sent_requires_delivery() -> dict[str, Any]:
             "missing delivery_message_id should be rejected explicitly",
         )
         assert_true(
+            "channel plus target/to" in session_only_start,
+            "completion report routes should reject session-only visible_delivery",
+        )
+        assert_true(
             "route mismatch" in wrong_route,
             "report-sent should reject a visible delivery route that differs from the original target",
         )
@@ -307,9 +342,349 @@ def smoke_report_sent_requires_delivery() -> dict[str, Any]:
             "status_after_failed_reports": state["status"],
             "missing_visible_delivery_rejected": "--visible-delivery is required" in missing_delivery,
             "missing_delivery_message_id_rejected": "--delivery-message-id is required" in missing_message_id,
+            "session_only_completion_route_rejected": "channel plus target/to" in session_only_start,
             "wrong_route_rejected": "route mismatch" in wrong_route,
             "extra_route_key_rejected": "route mismatch" in extra_route_key,
             "target_to_alias_accepted": reported_state["status"] == "reported",
+        }
+
+
+def smoke_message_sent_hook_records_report_proof() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="work-ledger-smoke-") as tmp:
+        root = Path(tmp)
+        work_id = "smoke-message-sent-report-proof"
+        visible_delivery = json.dumps({"channel": "telegram", "target": "telegram:test-user"})
+
+        run(
+            root,
+            "start",
+            "--work-id",
+            work_id,
+            "--owner-session-key",
+            "agent:main:telegram:direct:test-user",
+            "--visible-delivery",
+            visible_delivery,
+            "--request-summary",
+            "Smoke test message sent proof closes completion report",
+            "--side-effect-class",
+            "local_files",
+            "--checklist",
+            json.dumps(["complete", "message sent proof"]),
+            "--success-criteria",
+            json.dumps(["matching message:sent telemetry records report_sent"]),
+        )
+        run(root, "complete", "--work-id", work_id, "--note", "finished before proof telemetry")
+        unbound_same_route = run(
+            root,
+            "hook-observe",
+            "--work-id",
+            work_id,
+            "--payload",
+            json.dumps({
+                "type": "message",
+                "action": "sent",
+                "channel": "telegram",
+                "target": "test-user",
+                "messageId": "same-route-without-pending",
+            }),
+        )
+        unbound_state = run(root, "state", "--work-id", work_id)["items"][0]
+        assert_true(unbound_state["status"] == "completed_unreported", "same-route message:sent without a pending completion send must not close work")
+        assert_true(
+            unbound_same_route.get("recorded_report_sent") is not True,
+            "unbound same-route message:sent should stay observational",
+        )
+        wrong_route = run(
+            root,
+            "hook-observe",
+            "--work-id",
+            work_id,
+            "--payload",
+            json.dumps({
+                "type": "message",
+                "action": "sent",
+                "channel": "telegram",
+                "target": "other-user",
+                "messageId": "wrong-route-message",
+            }),
+        )
+        wrong_state = run(root, "state", "--work-id", work_id)["items"][0]
+        assert_true(wrong_state["status"] == "completed_unreported", "wrong-route message:sent must not close work")
+        assert_true(
+            wrong_route.get("recorded_report_sent") is not True,
+            "wrong-route message:sent should stay observational",
+        )
+
+        send_attempt = run(
+            root,
+            "hook-observe",
+            "--work-id",
+            work_id,
+            "--payload",
+            json.dumps({
+                "hook_event_name": "PreToolUse",
+                "session_id": "agent:main:telegram:direct:test-user",
+                "tool_use_id": "tool-visible-report",
+                "tool_name": "message",
+                "tool_input": {
+                    "action": "send",
+                    "channel": "telegram",
+                    "target": "test-user",
+                    "message": "Status: 완료",
+                },
+            }),
+        )
+        pending_state = run(root, "state", "--work-id", work_id)["items"][0]
+        assert_true(send_attempt.get("recorded_completion_report_send") is True, "matching completion report send should be recorded as pending")
+        assert_true(pending_state.get("pending_completion_report_send"), "pending completion report send should be durable")
+        mismatch = run(
+            root,
+            "hook-observe",
+            "--work-id",
+            work_id,
+            "--payload",
+            json.dumps({
+                "type": "message",
+                "action": "sent",
+                "channel": "telegram",
+                "target": "test-user",
+                "sessionKey": "agent:main:telegram:direct:test-user",
+                "tool_use_id": "different-tool",
+                "messageId": "wrong-tool-message",
+            }),
+        )
+        mismatch_state = run(root, "state", "--work-id", work_id)["items"][0]
+        assert_true(mismatch.get("recorded_report_sent") is not True, "wrong tool_use_id must not close report proof")
+        assert_true(mismatch_state["status"] == "completed_unreported", "wrong tool_use_id should leave work unreported")
+        no_session = run(
+            root,
+            "hook-observe",
+            "--work-id",
+            work_id,
+            "--payload",
+            json.dumps({
+                "type": "message",
+                "action": "sent",
+                "channel": "telegram",
+                "target": "test-user",
+                "messageId": "no-session-message",
+            }),
+        )
+        no_session_state = run(root, "state", "--work-id", work_id)["items"][0]
+        assert_true(no_session.get("recorded_report_sent") is not True, "message:sent without owner session must not close report proof")
+        assert_true(no_session_state["status"] == "completed_unreported", "missing session should leave work unreported")
+
+        proof = run(
+            root,
+            "hook-observe",
+            "--work-id",
+            work_id,
+            "--payload",
+            json.dumps({
+                "type": "message",
+                "action": "sent",
+                "channel": "telegram",
+                "target": "test-user",
+                "sessionKey": "agent:main:telegram:direct:test-user",
+                "tool_use_id": "tool-visible-report",
+                "messageId": "visible-report-message",
+            }),
+        )
+        duplicate = run(
+            root,
+            "hook-observe",
+            "--work-id",
+            work_id,
+            "--payload",
+            json.dumps({
+                "type": "message",
+                "action": "sent",
+                "channel": "telegram",
+                "target": "test-user",
+                "sessionKey": "agent:main:telegram:direct:test-user",
+                "tool_use_id": "tool-visible-report",
+                "messageId": "visible-report-message",
+            }),
+        )
+        reported_state = run(root, "state", "--work-id", work_id)["items"][0]
+        scan = run(root, "scan", "--cooldown-seconds", "0")
+        assert_true(proof.get("recorded_report_sent") is True, "matching message:sent should record report_sent")
+        assert_true(duplicate.get("duplicate") is True, "duplicate message:sent proof should be idempotent")
+        assert_true(reported_state["status"] == "reported", "message:sent proof should mark work reported")
+        assert_true(
+            reported_state["visible_delivery_proof"].get("message_id") == "visible-report-message",
+            "message:sent delivery id should be persisted as report proof",
+        )
+        assert_true(not scan["has_recoveries"], "reported work should not remain recoverable")
+        return {
+            "work_id": work_id,
+            "unbound_same_route_ignored": unbound_state["status"] == "completed_unreported",
+            "wrong_route_ignored": wrong_state["status"] == "completed_unreported",
+            "send_attempt_recorded": send_attempt.get("recorded_completion_report_send") is True,
+            "wrong_tool_use_id_ignored": mismatch_state["status"] == "completed_unreported",
+            "missing_session_ignored": no_session_state["status"] == "completed_unreported",
+            "message_sent_recorded_report": proof.get("recorded_report_sent") is True,
+            "duplicate_message_sent_deduped": duplicate.get("duplicate") is True,
+            "final_status": reported_state["status"],
+            "scan_clean": not scan["has_recoveries"],
+        }
+
+
+def smoke_message_sent_without_tool_use_id_is_time_bounded() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="work-ledger-smoke-") as tmp:
+        root = Path(tmp)
+
+        def make_pending(work_id: str) -> None:
+            run(
+                root,
+                "start",
+                "--work-id",
+                work_id,
+                "--owner-session-key",
+                "agent:main:telegram:direct:test-user",
+                "--visible-delivery",
+                json.dumps({"channel": "telegram", "target": "test-user"}),
+                "--request-summary",
+                "Smoke test no tool_use_id message sent proof window",
+                "--side-effect-class",
+                "local_files",
+                "--checklist",
+                json.dumps(["complete", "report"]),
+                "--success-criteria",
+                json.dumps(["no tool_use_id proof is time bounded"]),
+            )
+            run(root, "complete", "--work-id", work_id, "--note", "finished before proof telemetry")
+            send = run(
+                root,
+                "hook-observe",
+                "--work-id",
+                work_id,
+                "--payload",
+                json.dumps({
+                    "hook_event_name": "PreToolUse",
+                    "session_id": "agent:main:telegram:direct:test-user",
+                    "tool_name": "message",
+                    "tool_input": {
+                        "action": "send",
+                        "channel": "telegram",
+                        "target": "test-user",
+                        "message": "Status: 완료",
+                    },
+                }),
+            )
+            assert_true(send.get("recorded_completion_report_send") is True, "native send without tool_use_id should still create pending proof")
+
+        fresh_work_id = "smoke-message-sent-no-tool-fresh"
+        make_pending(fresh_work_id)
+        fresh = run(
+            root,
+            "hook-observe",
+            "--work-id",
+            fresh_work_id,
+            "--payload",
+            json.dumps({
+                "type": "message",
+                "action": "sent",
+                "channel": "telegram",
+                "target": "test-user",
+                "sessionKey": "agent:main:telegram:direct:test-user",
+                "messageId": "fresh-no-tool-message",
+            }),
+        )
+        fresh_state = run(root, "state", "--work-id", fresh_work_id)["items"][0]
+        assert_true(fresh.get("recorded_report_sent") is True, "fresh same-session no-tool proof should close report")
+        assert_true(fresh_state["status"] == "reported", "fresh no-tool proof should mark reported")
+
+        stale_work_id = "smoke-message-sent-no-tool-stale"
+        make_pending(stale_work_id)
+        age_pending_completion_report_send(root, stale_work_id, seconds=301)
+        stale = run(
+            root,
+            "hook-observe",
+            "--work-id",
+            stale_work_id,
+            "--payload",
+            json.dumps({
+                "type": "message",
+                "action": "sent",
+                "channel": "telegram",
+                "target": "test-user",
+                "sessionKey": "agent:main:telegram:direct:test-user",
+                "messageId": "stale-no-tool-message",
+            }),
+        )
+        stale_state = run(root, "state", "--work-id", stale_work_id)["items"][0]
+        assert_true(stale.get("recorded_report_sent") is not True, "stale no-tool proof must not close report")
+        assert_true(stale_state["status"] == "completed_unreported", "stale no-tool proof should remain recoverable")
+        return {
+            "fresh_status": fresh_state["status"],
+            "stale_status": stale_state["status"],
+            "fresh_recorded": fresh.get("recorded_report_sent") is True,
+            "stale_ignored": stale_state["status"] == "completed_unreported",
+        }
+
+
+def smoke_referenced_codex_uuid_not_terminal_task_lookup() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="work-ledger-smoke-") as tmp:
+        root = Path(tmp)
+        work_id = "smoke-referenced-codex-uuid"
+        codex_id = "019e3c3a-0000-7000-b000-000000000002"
+
+        run(
+            root,
+            "start",
+            "--work-id",
+            work_id,
+            "--owner-session-key",
+            "agent:main:telegram:direct:test-user",
+            "--visible-delivery",
+            json.dumps({"channel": "telegram", "target": "test-user"}),
+            "--request-summary",
+            "Smoke test Codex UUID subagent refs are not treated as OpenClaw task ids",
+            "--expected-outputs",
+            "subagent result",
+            "--side-effect-class",
+            "local_files",
+            "--subagents",
+            json.dumps([{"id": codex_id, "role": "review"}]),
+            "--checklist",
+            json.dumps(["wait for subagent"]),
+            "--success-criteria",
+            json.dumps(["bare codex uuid does not produce notFound terminal reconciliation"]),
+        )
+        run(
+            root,
+            "wait",
+            "--work-id",
+            work_id,
+            "--status",
+            "waiting_subagent",
+            "--subagent-session-keys",
+            codex_id,
+            "--note",
+            "waiting",
+        )
+
+        calls: list[str] = []
+        original = LEDGER_MODULE.load_openclaw_task_lookup
+
+        def fake_lookup(lookup: str) -> tuple[dict[str, Any] | None, str | None]:
+            calls.append(lookup)
+            return {"status": "notFound", "lookup": lookup}, None
+
+        LEDGER_MODULE.load_openclaw_task_lookup = fake_lookup
+        try:
+            result = LEDGER_MODULE.find_referenced_terminal_tasks(root)
+        finally:
+            LEDGER_MODULE.load_openclaw_task_lookup = original
+
+        assert_true(result["ok"] is True, "terminal task scan should succeed")
+        assert_true(not result["has_terminal_refs"], "bare Codex UUID subagent id should not become a terminal task")
+        assert_true(codex_id not in calls, "bare Codex UUID subagent id should not be looked up as an OpenClaw task")
+        return {
+            "work_id": work_id,
+            "lookups": calls,
+            "has_terminal_refs": result["has_terminal_refs"],
         }
 
 
@@ -1272,12 +1647,178 @@ def smoke_resume_start_does_not_hide_unreported_completion() -> dict[str, Any]:
         }
 
 
+def smoke_terminal_refs_precede_stale_recovery() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="work-ledger-smoke-") as tmp:
+        root = Path(tmp)
+        work_id = "smoke-terminal-ref-precedence"
+        ref = "agent:main:subagent:terminal-review"
+        visible_delivery = json.dumps({"channel": "telegram", "target": "telegram:test-user"})
+
+        run(
+            root,
+            "start",
+            "--work-id",
+            work_id,
+            "--owner-session-key",
+            "agent:main:telegram:direct:test-user",
+            "--visible-delivery",
+            visible_delivery,
+            "--request-summary",
+            "Smoke terminal subagent reconciliation precedence",
+            "--expected-outputs",
+            "terminal review",
+            "--checklist",
+            json.dumps(["wait", "terminal-ref"]),
+            "--success-criteria",
+            json.dumps(["terminal refs beat stale recovery"]),
+        )
+        run(
+            root,
+            "wait",
+            "--work-id",
+            work_id,
+            "--status",
+            "waiting_subagent",
+            "--subagent-session-keys",
+            ref,
+            "--note",
+            "waiting for terminal review",
+        )
+        age_events(root, work_id, 7200)
+
+        original_lookup = LEDGER_MODULE.load_openclaw_task_lookup
+
+        def fake_lookup(lookup: str) -> tuple[dict[str, Any] | None, str | None]:
+            if lookup == ref:
+                return {
+                    "taskId": "task-terminal-review",
+                    "runId": "run-terminal-review",
+                    "runtime": "subagent",
+                    "status": "succeeded",
+                    "label": "terminal review",
+                    "terminalSummary": "completed",
+                    "progressSummary": "review result text",
+                    "endedAt": 12345,
+                }, None
+            return None, None
+
+        try:
+            LEDGER_MODULE.load_openclaw_task_lookup = fake_lookup
+            check = LEDGER_MODULE.watchdog_check(root, cooldown_seconds=0)
+            assert_true(check["wake_reason"] == "referenced_task_reconciliation", "terminal refs should beat generic stale recovery")
+            terminal_refs = check["terminal_refs"]["terminal_refs"]
+            assert_true(len(terminal_refs) == 1, "expected one terminal ref")
+            assert_true(terminal_refs[0]["progressSummary"] == "review result text", "progressSummary should be included")
+            assert_true(terminal_refs[0].get("terminal_ref_fingerprint"), "terminal ref fingerprint should be included")
+            assert_true(len(terminal_refs[0].get("terminal_ref_fingerprints", [])) == 2, "terminal ref aliases should include stable and legacy fingerprints")
+
+            run(
+                root,
+                "terminal-ref-handled",
+                "--work-id",
+                work_id,
+                "--ref",
+                ref,
+                "--terminal-status",
+                "succeeded",
+                "--terminal-ref-fingerprints",
+                json.dumps(terminal_refs[0]["terminal_ref_fingerprints"]),
+                "--resolution",
+                "integrated",
+                "--note",
+                "terminal result integrated into recovery analysis",
+            )
+            handled_check = LEDGER_MODULE.watchdog_check(root, cooldown_seconds=0)
+            assert_true(handled_check["wake_reason"] == "recovery", "handled terminal ref should fall back to stale recovery")
+            assert_true(handled_check["terminal_refs"]["ignored"][0]["reason"] == "handled", "handled terminal ref should be ignored durably")
+        finally:
+            LEDGER_MODULE.load_openclaw_task_lookup = original_lookup
+
+        return {
+            "work_id": work_id,
+            "wake_reason_before_handled": check["wake_reason"],
+            "progress_summary_included": terminal_refs[0]["progressSummary"] == "review result text",
+            "handled_falls_back_to_recovery": handled_check["wake_reason"] == "recovery",
+        }
+
+
+def smoke_shared_terminal_ref_surfaces_each_work() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="work-ledger-smoke-") as tmp:
+        root = Path(tmp)
+        ref = "agent:main:subagent:shared-review"
+        visible_delivery = json.dumps({"channel": "telegram", "target": "telegram:test-user"})
+
+        for work_id in ("smoke-shared-terminal-ref-a", "smoke-shared-terminal-ref-b"):
+            run(
+                root,
+                "start",
+                "--work-id",
+                work_id,
+                "--owner-session-key",
+                "agent:main:telegram:direct:test-user",
+                "--visible-delivery",
+                visible_delivery,
+                "--request-summary",
+                f"Smoke shared terminal ref {work_id}",
+                "--expected-outputs",
+                "terminal review",
+                "--checklist",
+                json.dumps(["wait", "terminal-ref"]),
+                "--success-criteria",
+                json.dumps(["shared terminal ref is surfaced per work"]),
+            )
+            run(
+                root,
+                "wait",
+                "--work-id",
+                work_id,
+                "--status",
+                "waiting_subagent",
+                "--subagent-session-keys",
+                ref,
+                "--note",
+                "waiting for shared terminal review",
+            )
+
+        original_lookup = LEDGER_MODULE.load_openclaw_task_lookup
+        calls: list[str] = []
+
+        def fake_lookup(lookup: str) -> tuple[dict[str, Any] | None, str | None]:
+            calls.append(lookup)
+            return {
+                "taskId": "task-shared-review",
+                "runId": "run-shared-review",
+                "runtime": "subagent",
+                "status": "succeeded",
+                "terminalSummary": "completed",
+                "endedAt": 12345,
+            }, None
+
+        try:
+            LEDGER_MODULE.load_openclaw_task_lookup = fake_lookup
+            result = LEDGER_MODULE.find_referenced_terminal_tasks(root)
+        finally:
+            LEDGER_MODULE.load_openclaw_task_lookup = original_lookup
+
+        work_ids = {item["work_id"] for item in result["terminal_refs"]}
+        assert_true(result["has_terminal_refs"], "shared terminal ref should produce terminal refs")
+        assert_true(work_ids == {"smoke-shared-terminal-ref-a", "smoke-shared-terminal-ref-b"}, "shared terminal ref should surface for each active work")
+        assert_true(calls == [ref], "shared terminal ref lookup should be cached")
+        return {
+            "surfaced_work_ids": sorted(work_ids),
+            "lookup_calls": calls,
+        }
+
+
 def main() -> int:
     result = {
         "ok": True,
         "smokes": {
             "recovery_report_path": smoke_recovery_report_path(),
             "report_sent_requires_delivery": smoke_report_sent_requires_delivery(),
+            "message_sent_hook_records_report_proof": smoke_message_sent_hook_records_report_proof(),
+            "message_sent_without_tool_use_id_is_time_bounded": smoke_message_sent_without_tool_use_id_is_time_bounded(),
+            "referenced_codex_uuid_not_terminal_task_lookup": smoke_referenced_codex_uuid_not_terminal_task_lookup(),
             "visible_update_route_does_not_contaminate_report_route": smoke_visible_update_route_does_not_contaminate_report_route(),
             "report_sent_rejects_active_work": smoke_report_sent_rejects_active_work(),
             "abandoned_absorbs_late_lifecycle_events": smoke_abandoned_absorbs_late_lifecycle_events(),
@@ -1289,6 +1830,8 @@ def main() -> int:
             "waiting_user_minimum_stale_after": smoke_waiting_user_minimum_stale_after(),
             "gateway_side_effect_idempotency_policy": smoke_gateway_side_effect_idempotency_policy(),
             "resume_start_does_not_hide_unreported_completion": smoke_resume_start_does_not_hide_unreported_completion(),
+            "terminal_refs_precede_stale_recovery": smoke_terminal_refs_precede_stale_recovery(),
+            "shared_terminal_ref_surfaces_each_work": smoke_shared_terminal_ref_surfaces_each_work(),
         },
     }
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))

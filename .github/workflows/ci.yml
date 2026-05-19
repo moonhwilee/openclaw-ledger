@@ -15,10 +15,11 @@ jobs:
       - name: Run smoke tests
         run: |
           bash -n install.sh scripts/deploy-local.sh
+          tests/smoke/install_smoke.sh
           python3 -m py_compile src/hook_event_contract.py src/work_ledger.py scripts/work_ledger_watchdog_runner.py tests/smoke/work_ledger_smoke.py tests/smoke/work_ledger_hook_smoke.py tests/smoke/hook_event_contract_smoke.py tests/smoke/hook_action_classifier_golden_smoke.py tests/smoke/work_ledger_watchdog_runner_smoke.py
           python3 tests/smoke/work_ledger_smoke.py
           python3 tests/smoke/work_ledger_hook_smoke.py
           python3 tests/smoke/hook_event_contract_smoke.py
           python3 tests/smoke/hook_action_classifier_golden_smoke.py
           python3 tests/smoke/work_ledger_watchdog_runner_smoke.py
-          OPENCLAW_LEDGER_INSTALL_DIR="$(mktemp -d)" scripts/deploy-local.sh
+          OPENCLAW_LEDGER_INSTALL_DIR="$(mktemp -d)" OPENCLAW_LEDGER_HOME="$(mktemp -d)" scripts/deploy-local.sh

@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import subprocess
 import sys
 import tempfile
+from contextlib import redirect_stdout
 from pathlib import Path
 
 
@@ -42,6 +44,51 @@ def completed(cmd: list[str], returncode: int, stdout: str = "", stderr: str = "
     return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr=stderr)
 
 
+def write_runner_config(runner, tmp: str) -> None:
+    config_path = Path(tmp) / "config.json"
+    runner.DEFAULT_CONFIG_PATH = config_path
+    runner.PROMPT_PATH = Path(tmp) / "prompt.md"
+    runner.STATE_PATH = Path(tmp) / "state.json"
+    runner.PROMPT_PATH.write_text("watchdog prompt", encoding="utf-8")
+    config_path.write_text(
+        json.dumps(
+            {
+                "workspace": tmp,
+                "ledger_path": str(runner.LEDGER),
+                "openclaw_path": str(runner.OPENCLAW),
+                "prompt_path": str(runner.PROMPT_PATH),
+                "state_path": str(runner.STATE_PATH),
+                "fallback_session_key": "agent:main:telegram:direct:test-user",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_runner_has_no_private_defaults() -> None:
+    source = RUNNER_PATH.read_text(encoding="utf-8")
+    private_chat_id = "343" + "580" + "315"
+    private_home = "/Users/" + "moon"
+    external_prompt = "workspace/crons/" + "work-ledger-watchdog.md"
+    forbidden = [private_home, private_chat_id, external_prompt]
+    assert_true(not any(item in source for item in forbidden), "runner must not ship private paths, ids, or external prompt defaults")
+
+
+def test_runner_help_without_config() -> None:
+    runner = load_module("work_ledger_watchdog_runner_help_target", RUNNER_PATH)
+    original_argv = sys.argv[:]
+    try:
+        sys.argv = [str(RUNNER_PATH), "--help"]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = runner.main()
+    finally:
+        sys.argv = original_argv
+    output = buf.getvalue()
+    assert_true(code == 0, "runner --help should exit cleanly without config")
+    assert_true("Usage:" in output and "OPENCLAW_LEDGER_CONFIG" in output, "runner --help should explain config")
+
+
 def test_failed_wake_does_not_arm_suppression() -> None:
     runner = load_module("work_ledger_watchdog_runner_smoke_target", RUNNER_PATH)
     non_clean = {
@@ -56,12 +103,11 @@ def test_failed_wake_does_not_arm_suppression() -> None:
     wake_calls: list[int] = []
 
     with tempfile.TemporaryDirectory() as tmp:
-        runner.STATE_PATH = Path(tmp) / "state.json"
-        runner.PROMPT_PATH = Path(tmp) / "prompt.md"
-        runner.PROMPT_PATH.write_text("watchdog prompt", encoding="utf-8")
+        write_runner_config(runner, tmp)
 
         def fake_run(cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
             if "watchdog-check" in cmd:
+                assert_true("--root" in cmd and cmd[cmd.index("--root") + 1] == tmp, "runner should pass configured workspace as ledger root")
                 return completed(cmd, 0, stdout=clean_json)
             if cmd[:3] == [str(runner.OPENCLAW), "system", "event"]:
                 code = wake_returncodes.pop(0) if wake_returncodes else 0
@@ -89,12 +135,11 @@ def test_wake_exception_persists_failed_metadata() -> None:
     wake_results = ["timeout", "success"]
 
     with tempfile.TemporaryDirectory() as tmp:
-        runner.STATE_PATH = Path(tmp) / "state.json"
-        runner.PROMPT_PATH = Path(tmp) / "prompt.md"
-        runner.PROMPT_PATH.write_text("watchdog prompt", encoding="utf-8")
+        write_runner_config(runner, tmp)
 
         def fake_run(cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
             if "watchdog-check" in cmd:
+                assert_true("--root" in cmd and cmd[cmd.index("--root") + 1] == tmp, "runner should pass configured workspace as ledger root")
                 return completed(cmd, 0, stdout=json.dumps(non_clean))
             if cmd[:3] == [str(runner.OPENCLAW), "system", "event"]:
                 result = wake_results.pop(0)
@@ -144,10 +189,12 @@ def test_referenced_terminal_task_status_vocabulary() -> None:
 
 
 def main() -> None:
+    test_runner_has_no_private_defaults()
+    test_runner_help_without_config()
     test_failed_wake_does_not_arm_suppression()
     test_wake_exception_persists_failed_metadata()
     test_referenced_terminal_task_status_vocabulary()
-    print(json.dumps({"ok": True, "checked": ["wake-failure-suppression", "wake-exception-state", "referenced-terminal-statuses"]}, indent=2))
+    print(json.dumps({"ok": True, "checked": ["runner-public-defaults", "runner-help", "configured-root", "wake-failure-suppression", "wake-exception-state", "referenced-terminal-statuses"]}, indent=2))
 
 
 if __name__ == "__main__":

@@ -120,7 +120,7 @@ Ledger.
 Example:
 
 ```bash
-python3 scripts/work_ledger.py quick-start \
+python3 src/work_ledger.py quick-start \
   --kind coding \
   --summary "Fix PQ runtime health check" \
   --owner-session-key "agent:main:telegram:direct:test-user" \
@@ -154,6 +154,13 @@ The main-session watchdog route was tested with two controlled recovery cases:
 User-facing recovery reports must be final reports. Internal bookkeeping such
 as \`report-sent\` recording or a follow-up clean scan should not be described as
 \`Remaining\` unless the user must act or the recovery is genuinely incomplete.
+
+Keep user-facing \`Checked\` lines compact and outcome-focused. Routine
+environment checks such as Gmail auth, Codex OAuth, repo HEAD, internal task ids,
+delivery ids, recovery fingerprints, or raw smoke-suite lists belong in ledger
+verification, not Telegram reports, unless they failed or change the user's next
+decision. Prefer summaries such as \`핵심 회귀 테스트 통과\` or
+\`복구 루프가 다시 깨우지 않는 것까지 확인\`.
 
 ## Orphan Active Work Reconciliation
 
@@ -210,6 +217,11 @@ reconciliation input gathering, then returns one of:
 - `needs_wake` with `wake_reason=referenced_task_reconciliation`: inspect
   ledger-referenced terminal tasks/subagents, integrate their result or report
   failure, and do not restart or repeat side effects from this signal alone.
+  This signal takes precedence over generic stale recovery because a terminal
+  referenced task is a concrete state change, while staleness is only a fallback.
+  If the terminal result was inspected but the work is not complete, record
+  `terminal-ref-handled` with a clear resolution and the packet's
+  `terminal_ref_fingerprints` instead of auto-completing the work.
 - `needs_wake` with `wake_reason=orphan_reconciliation`: refresh/reconcile
   orphan state before any warning, then either record `orphan-handled` silently
   or send one aggregated result and record `orphan-warning-sent`.
@@ -219,6 +231,44 @@ reconciliation input gathering, then returns one of:
 The check is intentionally not a recovery engine. It must not restart work,
 repeat risky side effects, or send user-visible messages from scan/orphan output
 alone. The clean result must not wake the main session.
+
+`terminal-ref-handled` is only repeat-wake suppression for a reviewed terminal
+reference. It does not change the work status and must not be used as proof that
+the user-facing request is complete. If the resolution is `reported_failure`, pair
+it with a visible failure report or a durable `fail` / `wait` event that explains
+why no completion report is being sent yet.
+
+Heartbeat and other secondary monitors should call `watchdog-check --include-cron`,
+not raw `scan`, and should not send user-visible raw recovery warnings for
+ordinary `needs_wake` results. The LaunchAgent watchdog owns recovery wakeups;
+the user should normally see only the reconciled result report. A secondary
+monitor should alert only when the watchdog runner itself repeatedly fails or a
+recovery is blocked on a real user decision.
+
+## Installed Runner
+
+The installed runner is:
+
+```bash
+~/.openclaw/ledger/work_ledger_watchdog_runner.py
+```
+
+It is intentionally small:
+
+- load local config from `OPENCLAW_LEDGER_CONFIG` or
+  `~/.openclaw/ledger/config.json`
+- run `openclaw-ledger watchdog-check --include-cron`
+- return silently when the result is clean
+- wake the configured main session only for non-clean results
+- suppress duplicate wakeups for the same non-clean signature after a successful
+  wake
+
+For diagnostics:
+
+```bash
+~/.openclaw/ledger/work_ledger_watchdog_runner.py --help
+OPENCLAW_LEDGER_CONFIG=~/.openclaw/ledger/config.json ~/.openclaw/ledger/work_ledger_watchdog_runner.py
+```
 
 ## Boundaries
 
@@ -247,14 +297,14 @@ Before adding hook integration, confirm:
 The main entry point is:
 
 ```bash
-/Users/moon/.openclaw/bin/openclaw-ledger --help
+~/.openclaw/bin/openclaw-ledger --help
 ```
 
 For development, the deployed command should stay in sync with the workspace
 script:
 
 ```bash
-python3 scripts/work_ledger.py --help
+python3 src/work_ledger.py --help
 ```
 
 The smoke test is:
