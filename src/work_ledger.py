@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +99,7 @@ DEFAULT_THRESHOLDS_SECONDS = {
 }
 DEFAULT_ORPHAN_MIN_AGE_SECONDS = 30 * 60
 DEFAULT_ORPHAN_WARNING_SUPPRESSION_SECONDS = 24 * 60 * 60
+DEFAULT_TERMINAL_RETENTION_DAYS = 30
 ORPHAN_HANDLED_RESOLUTIONS = {
     "terminal_no_action",
     "referenced_after_refresh",
@@ -266,6 +267,15 @@ def assert_visible_delivery_matches_existing(existing: dict[str, Any], reported:
             raise SystemExit(f"report-sent visible_delivery missing original route key: {key}")
         if reported_value != expected_value:
             raise SystemExit(f"report-sent visible_delivery route mismatch for {key}")
+
+
+def visible_delivery_matches_completion_route(state: dict[str, Any], visible_delivery: dict[str, Any] | None) -> bool:
+    expected_route = canonical_visible_delivery_route(
+        state.get("completion_visible_delivery") or state.get("visible_delivery") or {}
+    )
+    if not expected_route or not visible_delivery:
+        return False
+    return canonical_visible_delivery_route(visible_delivery) == expected_route
 
 
 def delivery_message_id_from_payload(payload: dict[str, Any]) -> str | None:
@@ -577,9 +587,13 @@ def derive_state(work_id: str, events: list[dict[str, Any]]) -> dict[str, Any]:
             if event.get(key):
                 state[key] = merge_list(state.get(key, []), event[key])
 
-        if event_type in {"start", "progress", "wait", "verify"}:
+        silent_waiting_user = event_type == "wait" and (event.get("status") or current_status) == "waiting_user"
+        silent_waiting_user_progress = event_type == "progress" and current_status == "waiting_user"
+        if event_type in {"start", "progress", "wait", "verify"} and not silent_waiting_user and not silent_waiting_user_progress:
             state["last_progress_at"] = event.get("event_at")
         next_status = transition_status(current_status, event)
+        if event_type == "wait" and next_status == "waiting_user" and event.get("stale_after_seconds") is None:
+            state["stale_after_seconds"] = DEFAULT_THRESHOLDS_SECONDS["waiting_user"]
         if event_type == "complete" and next_status == "completed_unreported" and current_status != next_status:
             state["terminal_unreported_event"] = event
             state["terminal_unreported_next_recovery_action"] = state.get("next_recovery_action")
@@ -594,13 +608,19 @@ def derive_state(work_id: str, events: list[dict[str, Any]]) -> dict[str, Any]:
             if event.get("delivery_message_id"):
                 state.setdefault("visible_delivery_proof", {})["message_id"] = event["delivery_message_id"]
         elif event_type == "visible_update_sent":
-            state["last_visible_update_at"] = event.get("event_at")
-            if event.get("delivery_message_id"):
+            update_route_matches = visible_delivery_matches_completion_route(state, event.get("visible_delivery"))
+            if update_route_matches:
+                state["last_visible_update_at"] = event.get("event_at")
+                state["last_visible_update_delivery"] = canonical_visible_delivery_route(event.get("visible_delivery") or {})
+            if update_route_matches and event.get("delivery_message_id"):
                 state.setdefault("visible_delivery_proof", {})["last_update_message_id"] = event["delivery_message_id"]
         elif event_type == "wait_reminder_sent":
-            state["last_visible_update_at"] = event.get("event_at")
-            state["last_wait_reminder_at"] = event.get("event_at")
-            if event.get("delivery_message_id"):
+            reminder_route_matches = visible_delivery_matches_completion_route(state, event.get("visible_delivery"))
+            if reminder_route_matches:
+                state["last_visible_update_at"] = event.get("event_at")
+                state["last_wait_reminder_at"] = event.get("event_at")
+                state["last_wait_reminder_delivery"] = canonical_visible_delivery_route(event.get("visible_delivery") or {})
+            if reminder_route_matches and event.get("delivery_message_id"):
                 state.setdefault("visible_delivery_proof", {})["last_wait_reminder_message_id"] = event["delivery_message_id"]
         elif event_type == "abandon" and current_status == "abandoned":
             state["abandon_reason"] = event.get("abandon_reason") or event.get("note")
@@ -609,10 +629,11 @@ def derive_state(work_id: str, events: list[dict[str, Any]]) -> dict[str, Any]:
             state["last_recovery_packet_at"] = event.get("event_at")
             state["last_recovery_fingerprint"] = event.get("recovery_fingerprint")
 
-    activity_candidates = [
-        parse_time(state.get("last_progress_at")),
-        parse_time(state.get("last_wait_reminder_at")),
-    ]
+    activity_candidates = [parse_time(state.get("last_progress_at"))]
+    if visible_delivery_matches_completion_route(state, state.get("last_visible_update_delivery")):
+        activity_candidates.append(parse_time(state.get("last_visible_update_at")))
+    if visible_delivery_matches_completion_route(state, state.get("last_wait_reminder_delivery")):
+        activity_candidates.append(parse_time(state.get("last_wait_reminder_at")))
     last_activity_ts = max(activity_candidates)
     if last_activity_ts:
         state["last_activity_at"] = datetime.fromtimestamp(last_activity_ts, timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -655,6 +676,108 @@ def write_all_states_unlocked(root: Path) -> list[dict[str, Any]]:
 def write_all_states(root: Path) -> list[dict[str, Any]]:
     with file_lock(root):
         return write_all_states_unlocked(root)
+
+
+def terminal_prune_candidates(states: list[dict[str, Any]], *, days: int) -> tuple[set[str], list[dict[str, Any]], str]:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    prune_ids: set[str] = set()
+    candidates: list[dict[str, Any]] = []
+
+    for state in states:
+        work_id = state.get("work_id")
+        if not isinstance(work_id, str) or not work_id:
+            continue
+        if state.get("status") not in TERMINAL_STATES:
+            continue
+        terminal_at = (
+            parse_time(state.get("report_sent_at"))
+            or parse_time((state.get("last_material_event") or {}).get("event_at"))
+            or parse_time(state.get("updated_at"))
+            or parse_time(state.get("created_at"))
+        )
+        if not terminal_at:
+            continue
+        terminal_dt = datetime.fromtimestamp(terminal_at, timezone.utc)
+        if terminal_dt < cutoff:
+            prune_ids.add(work_id)
+            candidates.append({
+                "work_id": work_id,
+                "status": state.get("status"),
+                "terminal_at": terminal_dt.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+                "request_summary": state.get("request_summary"),
+            })
+
+    return prune_ids, candidates, cutoff.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def event_lines_excluding_work_ids(root: Path, prune_ids: set[str]) -> tuple[list[str], int]:
+    path = events_path(root)
+    if not path.exists():
+        return [], 0
+    kept_lines: list[str] = []
+    removed = 0
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                kept_lines.append(line)
+                continue
+            if event.get("work_id") in prune_ids:
+                removed += 1
+                continue
+            kept_lines.append(line)
+    return kept_lines, removed
+
+
+def prune_terminal_work(root: Path, *, days: int = DEFAULT_TERMINAL_RETENTION_DAYS, apply: bool = False) -> dict[str, Any]:
+    states = load_states(root)
+    prune_ids, candidates, cutoff = terminal_prune_candidates(states, days=days)
+
+    result = {
+        "ok": True,
+        "apply": apply,
+        "days": days,
+        "cutoff": cutoff,
+        "prune_count": len(prune_ids),
+        "candidates": candidates,
+        "policy": "Only reported/abandoned terminal work older than the retention window is pruned; active work is never pruned.",
+    }
+    if not apply or not prune_ids:
+        return result
+
+    with file_lock(root):
+        locked_states = [derive_state(work_id, events) for work_id, events in grouped_events(root).items()]
+        prune_ids, candidates, cutoff = terminal_prune_candidates(locked_states, days=days)
+        result["cutoff"] = cutoff
+        result["prune_count"] = len(prune_ids)
+        result["candidates"] = candidates
+        if not prune_ids:
+            result["events_removed"] = 0
+            result["remaining_state_count"] = len(locked_states)
+            return result
+
+        kept_lines, removed = event_lines_excluding_work_ids(root, prune_ids)
+        path = events_path(root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                for line in kept_lines:
+                    fh.write(line)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_name, path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+        for work_id in prune_ids:
+            with contextlib.suppress(FileNotFoundError):
+                state_file_path(root, work_id).unlink()
+        remaining = write_all_states_unlocked(root)
+    result["events_removed"] = removed
+    result["remaining_state_count"] = len(remaining)
+    return result
 
 
 def orphan_warnings_path(root: Path) -> Path:
@@ -1712,6 +1835,15 @@ def command_event(root: Path, args: argparse.Namespace, event_type: str) -> dict
         )
         if not getattr(args, "delivery_message_id", None):
             raise SystemExit("--delivery-message-id is required for report-sent")
+    if event_type in {"visible_update_sent", "wait_reminder_sent"}:
+        if not validate_visible_delivery(
+            load_json_object_arg(getattr(args, "visible_delivery", None), "--visible-delivery", required=True),
+            "--visible-delivery",
+            required=True,
+        ):
+            raise SystemExit("--visible-delivery is required")
+        if not getattr(args, "delivery_message_id", None):
+            raise SystemExit(f"--delivery-message-id is required for {event_type.replace('_', '-')}")
     event: dict[str, Any] = {
         "event_type": event_type,
         "work_id": args.work_id,
@@ -1927,6 +2059,10 @@ def build_parser() -> argparse.ArgumentParser:
     watchdog.add_argument("--min-age-seconds", type=int, default=DEFAULT_ORPHAN_MIN_AGE_SECONDS, help="Only report active tasks at least this old; use 0 for all")
     watchdog.add_argument("--cooldown-seconds", type=int, default=30 * 60, help="Recovery packet cooldown")
 
+    prune = sub.add_parser("prune-terminal", help="Prune old reported/abandoned terminal work; dry-run by default")
+    prune.add_argument("--days", type=int, default=DEFAULT_TERMINAL_RETENTION_DAYS)
+    prune.add_argument("--apply", action="store_true", help="Actually remove matching terminal work and compact events")
+
     orphan_warning = sub.add_parser("orphan-warning-sent", help="Suppress repeat warnings for a reported orphan fingerprint")
     orphan_warning.add_argument("--orphan-fingerprint", required=True)
     orphan_warning.add_argument("--orphan-fingerprints", help="JSON array of equivalent orphan fingerprints to suppress together")
@@ -1998,6 +2134,10 @@ def main() -> int:
         min_age_seconds = validate_positive_int(args.min_age_seconds, "--min-age-seconds") if args.min_age_seconds else 0
         cooldown_seconds = validate_positive_int(args.cooldown_seconds, "--cooldown-seconds") if args.cooldown_seconds else 0
         print(json.dumps(watchdog_check(root, include_cron=args.include_cron, min_age_seconds=min_age_seconds, cooldown_seconds=cooldown_seconds), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.command == "prune-terminal":
+        days = validate_positive_int(args.days, "--days")
+        print(json.dumps(prune_terminal_work(root, days=days or DEFAULT_TERMINAL_RETENTION_DAYS, apply=args.apply), ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     if args.command == "orphan-warning-sent":
         item = record_orphan_warning(

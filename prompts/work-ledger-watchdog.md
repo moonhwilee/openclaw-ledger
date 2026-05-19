@@ -50,10 +50,11 @@ Procedure:
      and record `report-sent`.
 6. If a recovery cannot finish in this turn because it is still waiting or
    blocked, do not send repeated reminders every tick. First record the
-   substantive durable outcome (`wait`, `wait-reminder-sent`, `progress`, or
-   `abandon`) or send the visible update if one is required. Record
-   `wake-delivered` with the packet `recovery_fingerprint` only after that
-   durable state transition or visible update succeeds.
+   substantive durable outcome (`wait`, `wait-reminder-sent`, or `abandon`) or
+   send the visible update if one is required. Do not use silent `progress` to
+   refresh a `waiting_user` recovery. Record `wake-delivered` with the packet
+   `recovery_fingerprint` only after that durable state transition or visible
+   update succeeds.
 7. If a packet has context gaps, do not invent the request. Repair the ledger
    context, ask the user only for a real missing decision, or mark
    blocked/abandoned.
