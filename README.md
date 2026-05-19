@@ -103,9 +103,6 @@ OPENCLAW_LEDGER_CONFIG=~/.openclaw/ledger/config.json ~/.openclaw/ledger/work_le
 
 macOS LaunchAgents do not wake a sleeping Mac. Checks resume after login/wake.
 
-Public builds must not ship maintainer usernames, absolute home paths, chat IDs,
-or personal session keys as defaults.
-
 ## How It Is Used
 
 Typical flow:
@@ -126,65 +123,63 @@ For command details:
 
 If `~/.openclaw/bin` is on your PATH, the shorter `openclaw-ledger` command works too.
 
-## Repository Layout
+## Common Operations
 
-- src/work_ledger.py - CLI implementation.
-- src/hook_event_contract.py - hook observation/guardrail classifier used by Ledger recovery safety checks.
-- tests/smoke/install_smoke.sh - installer smoke tests for CLI-only and full no-LaunchAgent setup.
-- tests/smoke/work_ledger_smoke.py - behavior smoke tests.
-- tests/smoke/work_ledger_hook_smoke.py and tests/smoke/hook_* - hook contract and guardrail smoke tests.
-- tests/smoke/work_ledger_watchdog_runner_smoke.py - deterministic watchdog runner smoke tests.
-- docs/ledger.md - current behavior, recovery policy, and command reference.
-
-## Local Tests
+For the full CLI reference, use command help:
 
 ~~~bash
-python3 -m py_compile src/hook_event_contract.py src/work_ledger.py scripts/work_ledger_watchdog_runner.py tests/smoke/work_ledger_smoke.py tests/smoke/work_ledger_hook_smoke.py tests/smoke/hook_event_contract_smoke.py tests/smoke/hook_action_classifier_golden_smoke.py tests/smoke/work_ledger_watchdog_runner_smoke.py
-tests/smoke/install_smoke.sh
-python3 tests/smoke/work_ledger_smoke.py
-python3 tests/smoke/work_ledger_hook_smoke.py
-python3 tests/smoke/hook_event_contract_smoke.py
-python3 tests/smoke/hook_action_classifier_golden_smoke.py
-python3 tests/smoke/work_ledger_watchdog_runner_smoke.py
+openclaw-ledger --help
+openclaw-ledger <command> --help
 ~~~
 
-## Maintainer Workflow
-
-Use this repository as the source of truth for Ledger changes.
+Check current Ledger work state:
 
 ~~~bash
-# edit and test inside this repo
-python3 tests/smoke/work_ledger_smoke.py
-python3 tests/smoke/work_ledger_hook_smoke.py
-python3 tests/smoke/hook_event_contract_smoke.py
-python3 tests/smoke/hook_action_classifier_golden_smoke.py
-python3 tests/smoke/work_ledger_watchdog_runner_smoke.py
-tests/smoke/install_smoke.sh
-
-# deploy the verified repo version to the local OpenClaw server
-scripts/deploy-local.sh
-
-# publish with the normal GitHub flow
-git checkout -b codex/my-ledger-change
-git add .
-git commit -m "Describe Ledger change"
-git push -u origin HEAD
-gh pr create --draft --base main --head "$(git branch --show-current)"
+openclaw-ledger state
 ~~~
 
-Do not edit the local installed files under `~/.openclaw/bin` as the source of truth. They are deploy outputs from this repository.
+Check whether the watchdog sees recoverable work:
 
-## Release Policy
+~~~bash
+openclaw-ledger watchdog-check --include-cron
+~~~
 
-GitHub Releases are the public version source for Ledger. The release shown on the repository sidebar, for example `openclaw-ledger v0.3.0`, is created from the matching Git tag `v0.3.0`.
+Inspect unresolved orphan candidates without mutating state:
 
-Ledger does not keep a separate in-repo version file. For a release:
+~~~bash
+openclaw-ledger orphans --include-cron
+~~~
 
-1. Merge the verified PR to `main`.
-2. Create and push an annotated tag such as `v0.3.0` on the merged main commit.
-3. Create the GitHub Release from that tag with the title `openclaw-ledger v0.3.0`.
+Preview cleanup of old terminal work. This is a dry-run by default:
 
-Do not treat ad-hoc text files as release versions; they drift from GitHub Releases too easily.
+~~~bash
+openclaw-ledger prune-terminal --days 30
+~~~
+
+Apply cleanup only after reviewing the dry-run output:
+
+~~~bash
+openclaw-ledger prune-terminal --days 30 --apply
+~~~
+
+Pruning only removes `reported` and `abandoned` work older than the retention
+window. Active, waiting, verifying, completed-unreported, and failed-unreported
+work is not pruned.
+
+Lifecycle commands such as `start`, `progress`, `wait`, `verify`, `complete`,
+and `report-sent` are usually called by the orchestrator. They are documented in
+`docs/ledger.md` and available through command help.
+
+## More Documentation
+
+`docs/ledger.md` explains the Ledger state model, recovery policy, and command
+reference.
+
+## Versioning
+
+GitHub Releases are the public version source for Ledger. The release shown on
+the repository sidebar, for example `openclaw-ledger v0.5.0`, is created from
+the matching Git tag `v0.5.0`.
 
 ## License
 
