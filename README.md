@@ -116,6 +116,18 @@ gh pr create --draft --base main --head "$(git branch --show-current)"
 
 Do not edit the local installed files under `~/.openclaw/bin` as the source of truth. They are deploy outputs from this repository.
 
+## Release Policy
+
+GitHub Releases are the public version source for Ledger. The release shown on the repository sidebar, for example `openclaw-ledger v0.2.0`, is created from the matching Git tag `v0.2.0`.
+
+Ledger does not keep a separate in-repo version file. For a release:
+
+1. Merge the verified PR to `main`.
+2. Create and push an annotated tag such as `v0.2.0` on the merged main commit.
+3. Create the GitHub Release from that tag with the title `openclaw-ledger v0.2.0`.
+
+Do not treat ad-hoc text files as release versions; they drift from GitHub Releases too easily.
+
 ## License
 
 MIT
