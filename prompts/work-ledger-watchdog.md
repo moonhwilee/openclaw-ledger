@@ -32,8 +32,11 @@ Procedure:
    - make the visible report user-final: do not say that internal bookkeeping
      such as `report-sent` recording or a follow-up `scan` remains; use
      `Remaining: 없음` when only ledger cleanup/verification is left;
-   - record `report-sent` with the packet's `visible_delivery` and the
-     delivered message id after the visible report succeeds.
+   - after the visible report succeeds, record `complete-reported` with the
+     packet's `visible_delivery` and the delivered message id. Use plain
+     `report-sent` only when the ledger item is already in
+     `completed_unreported` or `failed_unreported` and you are intentionally
+     recording proof for that existing terminal state.
 5. If `wake_reason=referenced_task_reconciliation`, inspect each terminal
    task/subagent referenced by active ledger work:
    - integrate the terminal result into the existing ledger work, or report the
@@ -47,7 +50,8 @@ Procedure:
    - do not restart the task, rerun subagents, or repeat risky side effects from
      this signal alone;
    - if the user-facing work is now complete, send one visible completion report
-     and record `report-sent`.
+     and record `complete-reported` with the delivered message id. Use
+     `report-sent` only for an already-unreported terminal ledger item.
 6. If a recovery cannot finish in this turn because it is still waiting or
    blocked, do not send repeated reminders every tick. First record the
    substantive durable outcome (`wait`, `wait-reminder-sent`, or `abandon`) or

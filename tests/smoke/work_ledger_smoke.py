@@ -904,6 +904,152 @@ def smoke_report_sent_rejects_active_work() -> dict[str, Any]:
         }
 
 
+def smoke_complete_reported_records_terminal_proof() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="work-ledger-smoke-") as tmp:
+        root = Path(tmp)
+        work_id = "smoke-complete-reported"
+        mismatch_work_id = "smoke-complete-reported-mismatch"
+        precompleted_work_id = "smoke-complete-reported-precompleted"
+        prefailed_work_id = "smoke-complete-reported-prefailed"
+        visible_delivery = json.dumps({"channel": "telegram", "target": "telegram:test-user"})
+        wrong_visible_delivery = json.dumps({"channel": "telegram", "target": "other-user"})
+
+        def start_work(item: str) -> None:
+            run(
+                root,
+                "start",
+                "--work-id",
+                item,
+                "--owner-session-key",
+                "agent:main:telegram:direct:test-user",
+                "--visible-delivery",
+                visible_delivery,
+                "--request-summary",
+                "Smoke test atomic complete plus report proof",
+                "--expected-outputs",
+                "smoke-report",
+                "--next-recovery-action",
+                "Use complete-reported after final visible delivery.",
+                "--side-effect-class",
+                "local_files",
+                "--no-artifact-expected",
+                "--checklist",
+                json.dumps(["start", "send final report", "record proof"]),
+                "--success-criteria",
+                json.dumps(["complete and report proof are recorded together"]),
+            )
+
+        start_work(work_id)
+        result = run(
+            root,
+            "complete-reported",
+            "--work-id",
+            work_id,
+            "--visible-delivery",
+            visible_delivery,
+            "--delivery-message-id",
+            "complete-reported-message",
+            "--note",
+            "verified and final report delivered",
+            "--verification",
+            json.dumps({"focused_check": "passed"}),
+        )
+        state = run(root, "state", "--work-id", work_id)["items"][0]
+        scan = run(root, "scan", "--cooldown-seconds", "0")
+        assert_true(result["completed_event"]["event_type"] == "complete", "complete-reported must append a complete event")
+        assert_true(result["report_event"]["event_type"] == "report_sent", "complete-reported must append report_sent proof")
+        assert_true(state["status"] == "reported", "complete-reported should leave work reported")
+        assert_true(state["completion_report_sent"] is True, "complete-reported should mark completion_report_sent")
+        assert_true(state["verification"].get("focused_check") == "passed", "complete verification should be preserved")
+        assert_true(
+            state["visible_delivery_proof"].get("message_id") == "complete-reported-message",
+            "complete-reported should persist final delivery id",
+        )
+        assert_true(not scan["has_recoveries"], "complete-reported work should not recover")
+        duplicate_error = run_expect_fail(
+            root,
+            "complete-reported",
+            "--work-id",
+            work_id,
+            "--visible-delivery",
+            visible_delivery,
+            "--delivery-message-id",
+            "duplicate-complete-reported-message",
+        )
+        duplicate_state = run(root, "state", "--work-id", work_id)["items"][0]
+        assert_true("active or unreported completed/failed" in duplicate_error, "complete-reported should reject already reported work")
+        assert_true(duplicate_state["events_count"] == state["events_count"], "duplicate complete-reported must not append events")
+        assert_true(
+            duplicate_state["visible_delivery_proof"].get("message_id") == "complete-reported-message",
+            "duplicate complete-reported must not overwrite the original proof",
+        )
+
+        start_work(mismatch_work_id)
+        mismatch_error = run_expect_fail(
+            root,
+            "complete-reported",
+            "--work-id",
+            mismatch_work_id,
+            "--visible-delivery",
+            wrong_visible_delivery,
+            "--delivery-message-id",
+            "wrong-route-message",
+            "--note",
+            "should not mutate",
+        )
+        mismatch_state = run(root, "state", "--work-id", mismatch_work_id)["items"][0]
+        assert_true("route mismatch" in mismatch_error, "wrong-route complete-reported should explain mismatch")
+        assert_true(mismatch_state["status"] == "running", "wrong-route complete-reported must not append complete")
+        assert_true(mismatch_state["events_count"] == 1, "wrong-route complete-reported must not append any event")
+
+        start_work(precompleted_work_id)
+        run(root, "complete", "--work-id", precompleted_work_id, "--note", "already complete")
+        precompleted = run(
+            root,
+            "complete-reported",
+            "--work-id",
+            precompleted_work_id,
+            "--visible-delivery",
+            visible_delivery,
+            "--delivery-message-id",
+            "precompleted-message",
+        )
+        precompleted_state = run(root, "state", "--work-id", precompleted_work_id)["items"][0]
+        assert_true(precompleted["completed_event"] is None, "precompleted work should not get a duplicate complete")
+        assert_true(precompleted_state["status"] == "reported", "precompleted work should report cleanly")
+        assert_true(precompleted_state["events_count"] == 3, "precompleted work should have start, complete, report")
+
+        start_work(prefailed_work_id)
+        run(root, "fail", "--work-id", prefailed_work_id, "--failure-reason", "failed before report")
+        prefailed = run(
+            root,
+            "complete-reported",
+            "--work-id",
+            prefailed_work_id,
+            "--visible-delivery",
+            visible_delivery,
+            "--delivery-message-id",
+            "prefailed-message",
+            "--report-note",
+            "failure report delivered",
+        )
+        prefailed_state = run(root, "state", "--work-id", prefailed_work_id)["items"][0]
+        assert_true(prefailed["completed_event"] is None, "failed_unreported work should not get a complete event")
+        assert_true(prefailed_state["status"] == "reported", "failed_unreported work should report cleanly")
+        assert_true(prefailed_state.get("failure_reason") == "failed before report", "failure metadata should be preserved")
+        return {
+            "work_id": work_id,
+            "final_status": state["status"],
+            "message_id_recorded": state["visible_delivery_proof"].get("message_id"),
+            "wrong_route_left_status": mismatch_state["status"],
+            "precompleted_events_count": precompleted_state["events_count"],
+            "prefailed_status": prefailed_state["status"],
+            "prefailed_reason_preserved": prefailed_state.get("failure_reason") == "failed before report",
+            "duplicate_rejected": duplicate_state["events_count"] == state["events_count"],
+            "scan_clean": not scan["has_recoveries"],
+        }
+
+
 def smoke_abandoned_absorbs_late_lifecycle_events() -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="work-ledger-smoke-") as tmp:
         root = Path(tmp)
@@ -1861,6 +2007,10 @@ def smoke_gateway_side_effect_idempotency_policy() -> dict[str, Any]:
             in packet["required_recovery_instruction"],
             "packet should instruct the recovered session not to repeat risky side effects",
         )
+        assert_true(
+            "complete-reported" in packet["required_recovery_instruction"],
+            "active recovery packet should instruct complete-reported after visible delivery",
+        )
         return {
             "work_id": work_id,
             "missing_idempotency_rejected": "--idempotency-key is required" in missing_idempotency,
@@ -2110,6 +2260,7 @@ def main() -> int:
             "referenced_codex_uuid_not_terminal_task_lookup": smoke_referenced_codex_uuid_not_terminal_task_lookup(),
             "visible_update_route_does_not_contaminate_report_route": smoke_visible_update_route_does_not_contaminate_report_route(),
             "report_sent_rejects_active_work": smoke_report_sent_rejects_active_work(),
+            "complete_reported_records_terminal_proof": smoke_complete_reported_records_terminal_proof(),
             "abandoned_absorbs_late_lifecycle_events": smoke_abandoned_absorbs_late_lifecycle_events(),
             "orphans_ignore_fresh_tasks": smoke_orphans_ignore_fresh_tasks(),
             "orphan_uses_idle_activity_for_freshness": smoke_orphan_uses_idle_activity_for_freshness(),

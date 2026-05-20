@@ -58,9 +58,18 @@ and LLM-generated payloads should not supply their own keys.
 2. Record progress as files, tasks, or subagents change.
 3. Record waits when blocked on subagents, user input, or external systems.
 4. Record verification when checks are running or complete.
-5. Mark the work complete only after the requested outcome is handled.
-6. Send a visible completion report.
-7. Record `report_sent`.
+5. Send the visible completion report after the requested outcome is handled.
+6. Record completion and report proof.
+
+Prefer `complete-reported` only after a successful visible report send has
+returned a delivery id. It records `complete` and `report_sent` in one locked
+batch, preserving the strict proof model while reducing the chance of leaving
+finished work in `completed_unreported`. It does not send the message itself.
+For an entry that is already `completed_unreported` or `failed_unreported`, the
+same command records only the final report proof and does not rewrite the prior
+terminal event. Keep using separate `complete`/`fail` and `report-sent` only
+when the send and proof arrive through separate hook telemetry or when you are
+explicitly repairing older ledger history.
 
 For GoalFlow approval pauses, the visible approval request/update and the
 Ledger wait state are both required. GoalFlow uses `waiting_approval` /
@@ -151,11 +160,11 @@ On recovery, the main session should:
 The main-session watchdog route was tested with two controlled recovery cases:
 
 - \`completed_unreported\`: the watchdog detected an already-completed ledger item
-  missing a visible report, sent the completion report, recorded \`report-sent\`,
+  missing a visible report, sent the completion report, recorded final proof,
   and the next scan was clean.
 - \`stale running\`: the watchdog detected a stale running ledger item, executed
   only the packet's safe local marker-file action, verified the marker file,
-  recorded verify/complete/report-sent, and the next scan was clean.
+  recorded verification and final proof, and the next scan was clean.
 
 User-facing recovery reports must be final reports. Internal bookkeeping such
 as \`report-sent\` recording or a follow-up clean scan should not be described as
@@ -219,7 +228,9 @@ reconciliation input gathering, then returns one of:
 
 - `clean`: no LLM/user-visible work is needed.
 - `needs_wake` with `wake_reason=recovery`: process recovery packets, verify,
-  send one visible completion report, then record `report-sent`.
+  send one visible completion report, then record `complete-reported` with the
+  delivered message id. Use `report-sent` only for an already-unreported
+  terminal item or hook-driven proof repair.
 - `needs_wake` with `wake_reason=referenced_task_reconciliation`: inspect
   ledger-referenced terminal tasks/subagents, integrate their result or report
   failure, and do not restart or repeat side effects from this signal alone.
