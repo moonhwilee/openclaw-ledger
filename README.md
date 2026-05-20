@@ -26,7 +26,7 @@ Simple one-shot answers usually do not need Ledger.
 |---|---|
 | **1. Record** | Start work entry -> record progress -> record wait or verification |
 | **2. Detect** | Watchdog check -> find stale or completed-but-unreported work -> create recovery packet |
-| **3. Recover** | Wake main session -> reconcile state -> send visible report -> mark reported |
+| **3. Recover** | Wake main session -> reconcile state -> send visible report -> record final proof |
 
 ## What It Does
 
@@ -167,8 +167,8 @@ window. Active, waiting, verifying, completed-unreported, and failed-unreported
 work is not pruned.
 
 Lifecycle commands such as `start`, `progress`, `wait`, `verify`, `complete`,
-and `report-sent` are usually called by the orchestrator. They are documented in
-`docs/ledger.md` and available through command help.
+`complete-reported`, and `report-sent` are usually called by the orchestrator.
+They are documented in `docs/ledger.md` and available through command help.
 
 ## More Documentation
 

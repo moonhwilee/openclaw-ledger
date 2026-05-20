@@ -72,6 +72,7 @@ run_install "$full_home" --no-launch-agent >"$TMP/openclaw-ledger-install-full.o
 test -x "$full_home/bin/openclaw-ledger"
 test -x "$full_home/ledger/work_ledger_watchdog_runner.py"
 test -s "$full_home/ledger/prompts/work-ledger-watchdog.md"
+cmp "$full_home/ledger/prompts/work-ledger-watchdog.md" "$ROOT/prompts/work-ledger-watchdog.md"
 grep -q "LaunchAgent: skipped" "$TMP/openclaw-ledger-install-full.out"
 python3 - "$full_home/ledger/config.json" "$full_home" <<'PY'
 import json
@@ -144,6 +145,27 @@ sent = run(
 assert sent.get("recorded_report_sent") is True
 state = run("state", "--work-id", work_id)["items"][0]
 assert state["status"] == "reported"
+
+complete_reported_id = "install-complete-reported"
+run(
+    "start",
+    "--work-id", complete_reported_id,
+    "--owner-session-key", config["fallback_session_key"],
+    "--visible-delivery", json.dumps(config["visible_delivery"]),
+    "--request-summary", "install complete-reported proof",
+    "--checklist", json.dumps(["complete", "report"]),
+    "--success-criteria", json.dumps(["installed complete-reported closes cleanly"]),
+)
+run(
+    "complete-reported",
+    "--work-id", complete_reported_id,
+    "--visible-delivery", json.dumps(config["visible_delivery"]),
+    "--delivery-message-id", "install-complete-reported-message",
+    "--note", "done",
+)
+complete_reported_state = run("state", "--work-id", complete_reported_id)["items"][0]
+assert complete_reported_state["status"] == "reported"
+assert complete_reported_state["visible_delivery_proof"]["message_id"] == "install-complete-reported-message"
 PY
 
 bad_home="$TMP/bad"
@@ -207,4 +229,35 @@ python3 -m json.tool "$full_home/ledger/config.json" >/dev/null
 "$full_home/bin/openclaw-ledger" --help >/dev/null
 "$full_home/bin/openclaw-ledger" watchdog-check --include-cron >/dev/null
 
-echo '{"ok":true,"checked":["cli-only-install","full-no-launch-agent-install","default-launchagent-install","permissions","bad-session-key-no-partial-install","launchagent-failure-rollback"]}'
+deploy_home="$TMP/deploy-local"
+mkdir -p "$deploy_home/bin" "$deploy_home/ledger"
+OPENCLAW_LEDGER_INSTALL_DIR="$deploy_home/bin" \
+OPENCLAW_LEDGER_HOME="$deploy_home/ledger" \
+OPENCLAW_LEDGER_RUNNER_PATH="$deploy_home/ledger/work_ledger_watchdog_runner.py" \
+OPENCLAW_LEDGER_PROMPT_PATH="$deploy_home/ledger/prompts/work-ledger-watchdog.md" \
+  bash "$ROOT/scripts/deploy-local.sh" >"$TMP/openclaw-ledger-deploy-local.out"
+test -x "$deploy_home/bin/openclaw-ledger"
+test -x "$deploy_home/bin/hook_event_contract.py"
+test -x "$deploy_home/ledger/work_ledger_watchdog_runner.py"
+cmp "$deploy_home/bin/openclaw-ledger" "$ROOT/src/work_ledger.py"
+cmp "$deploy_home/bin/hook_event_contract.py" "$ROOT/src/hook_event_contract.py"
+cmp "$deploy_home/ledger/work_ledger_watchdog_runner.py" "$ROOT/scripts/work_ledger_watchdog_runner.py"
+cmp "$deploy_home/ledger/prompts/work-ledger-watchdog.md" "$ROOT/prompts/work-ledger-watchdog.md"
+python3 - "$deploy_home/bin/openclaw-ledger.deploy.json" "$ROOT" <<'PY'
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+stamp = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+root = Path(sys.argv[2])
+head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=root, text=True).strip())
+assert stamp["component"] == "openclaw-ledger"
+assert stamp["source_repo"] == str(root)
+assert stamp["commit"] == head
+assert stamp["dirty"] is dirty
+assert stamp["deployed_at"].endswith("Z")
+PY
+
+echo '{"ok":true,"checked":["cli-only-install","full-no-launch-agent-install","prompt-source-parity","deploy-local-stamp-and-parity","default-launchagent-install","permissions","bad-session-key-no-partial-install","launchagent-failure-rollback"]}'

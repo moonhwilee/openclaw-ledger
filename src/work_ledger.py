@@ -412,19 +412,30 @@ def append_event(root: Path, event: dict[str, Any]) -> dict[str, Any]:
 
 
 def append_event_unlocked(root: Path, event: dict[str, Any]) -> dict[str, Any]:
-    event = dict(event)
-    event.setdefault("schema_version", SCHEMA_VERSION)
-    event.setdefault("event_at", now_iso())
-    event["sequence"] = next_sequence(root)
+    return append_events_unlocked(root, [event])[0]
+
+
+def append_events_unlocked(root: Path, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not events:
+        return []
+    sequence = next_sequence(root)
+    prepared: list[dict[str, Any]] = []
+    event_at = now_iso()
+    for offset, event in enumerate(events):
+        item = dict(event)
+        item.setdefault("schema_version", SCHEMA_VERSION)
+        item.setdefault("event_at", event_at)
+        item["sequence"] = sequence + offset
+        prepared.append(item)
     events_path(root).parent.mkdir(parents=True, exist_ok=True)
-    line = json.dumps(event, ensure_ascii=False, sort_keys=True)
     with events_path(root).open("a", encoding="utf-8") as fh:
-        fh.write(line + "\n")
+        for event in prepared:
+            line = json.dumps(event, ensure_ascii=False, sort_keys=True)
+            fh.write(line + "\n")
         fh.flush()
         os.fsync(fh.fileno())
     write_all_states_unlocked(root)
-    return event
-
+    return prepared
 
 def read_events(root: Path, include_corrupt: bool = True) -> list[dict[str, Any]]:
     path = events_path(root)
@@ -1084,7 +1095,7 @@ def make_recovery_packet(root: Path, state: dict[str, Any], reason: str) -> dict
         recovery_instruction = (
             "This work is waiting for user input and may not be stuck. Reconcile current conversation "
             "state first. If the user has answered, continue the work, verify, send the visible completion "
-            "report, then record report-sent. If still blocked on user input, send at most one concise "
+            "report, then record complete-reported with the delivery id. If still blocked on user input, send at most one concise "
             "waiting reminder and record a fresh wait event instead of report-sent."
         )
     else:
@@ -1092,7 +1103,7 @@ def make_recovery_packet(root: Path, state: dict[str, Any], reason: str) -> dict
             "You are recovering unfinished work, not merely notifying. Read this ledger state, "
             "inspect current artifacts/tasks before acting, do not repeat external/destructive "
             "side effects without user approval, execute the next safe recovery action, verify, "
-            "send one visible completion report, then record report-sent."
+            "send one visible completion report, then record complete-reported with the delivery id."
         )
     visible_delivery_route = state.get("completion_visible_delivery") or canonical_visible_delivery_route(state.get("visible_delivery") or {})
     packet = {
@@ -1765,7 +1776,7 @@ def command_quick_start(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     event_args = argparse.Namespace(
         work_id=work_id,
         note=args.note or f"quick-start preset: {args.kind}",
-        next_recovery_action=args.next_recovery_action or "Reconcile current state, execute only the next safe action, verify, send visible report, then record report-sent.",
+        next_recovery_action=args.next_recovery_action or "Reconcile current state, execute only the next safe action, verify, send visible report, then record complete-reported with the delivery id.",
         expected_outputs=args.expected_outputs,
         artifact_paths=args.artifact_paths,
         openclaw_task_ids=args.openclaw_task_ids,
@@ -1902,6 +1913,59 @@ def command_event(root: Path, args: argparse.Namespace, event_type: str) -> dict
                 raise SystemExit("report-sent is allowed only after complete or fail leaves work unreported")
             assert_visible_delivery_matches_existing(existing_state, event.get("visible_delivery") or {})
         return append_event_unlocked(root, event)
+
+
+def command_complete_reported(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+    validate_work_id(args.work_id)
+    reported_visible_delivery = validate_visible_delivery(
+        load_json_object_arg(args.visible_delivery, "--visible-delivery", required=True),
+        "--visible-delivery",
+        required=True,
+        require_channel_target=True,
+    )
+    if not args.delivery_message_id:
+        raise SystemExit("--delivery-message-id is required for complete-reported")
+    complete_event: dict[str, Any] = {
+        "event_type": "complete",
+        "work_id": args.work_id,
+        "note": args.note,
+        "next_recovery_action": args.next_recovery_action,
+        "verification": load_json_arg(args.verification, None),
+        "expected_outputs": split_csv(args.expected_outputs),
+        "artifact_paths": split_csv(args.artifact_paths),
+        "openclaw_task_ids": split_csv(args.openclaw_task_ids),
+        "subagent_session_keys": split_csv(args.subagent_session_keys),
+        "side_effects_performed": split_csv(args.side_effects_performed),
+        "external_actions_attempted": split_csv(args.external_actions_attempted),
+    }
+    subagents = load_json_arg(args.subagents, None)
+    if subagents is not None:
+        complete_event["subagents"] = subagents
+    complete_event = {key: value for key, value in complete_event.items() if value not in (None, [], {})}
+    with file_lock(root):
+        existing_events = grouped_events(root).get(args.work_id)
+        if not existing_events:
+            raise SystemExit(f"unknown work_id: {args.work_id}")
+        existing_state = derive_state(args.work_id, existing_events)
+        assert_visible_delivery_matches_existing(existing_state, reported_visible_delivery or {})
+        events_to_append: list[dict[str, Any]] = []
+        if existing_state.get("status") in ACTIVE_STATES:
+            events_to_append.append(complete_event)
+        elif existing_state.get("status") in UNREPORTED_TERMINAL_STATES:
+            pass
+        else:
+            raise SystemExit("complete-reported is allowed only for active or unreported completed/failed work")
+        events_to_append.append({
+            "event_type": "report_sent",
+            "work_id": args.work_id,
+            "note": args.report_note or "Visible completion report sent and proof recorded by complete-reported.",
+            "visible_delivery": reported_visible_delivery,
+            "delivery_message_id": args.delivery_message_id,
+        })
+        appended = append_events_unlocked(root, events_to_append)
+    completed_event = appended[0] if len(appended) == 2 else None
+    report_event = appended[-1]
+    return {"completed_event": completed_event, "report_event": report_event}
 
 
 def command_hook_observe(root: Path, args: argparse.Namespace) -> dict[str, Any]:
@@ -2043,6 +2107,12 @@ def build_parser() -> argparse.ArgumentParser:
             cmd.add_argument("--visible-delivery")
             cmd.add_argument("--delivery-message-id")
 
+    complete_reported = sub.add_parser("complete-reported", help="Record completion and final visible report proof in one locked operation")
+    add_common_event_args(complete_reported)
+    complete_reported.add_argument("--visible-delivery", required=True)
+    complete_reported.add_argument("--delivery-message-id", required=True)
+    complete_reported.add_argument("--report-note")
+
     state = sub.add_parser("state")
     state.add_argument("--work-id")
 
@@ -2115,6 +2185,10 @@ def main() -> int:
         }.get(args.command, args.command.replace("-", "_"))
         event = command_event(root, args, event_type)
         print(json.dumps({"ok": True, "event": event}, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.command == "complete-reported":
+        result = command_complete_reported(root, args)
+        print(json.dumps({"ok": True, **result}, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     if args.command == "state":
         states = load_states(root)
