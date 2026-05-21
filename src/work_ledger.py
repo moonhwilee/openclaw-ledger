@@ -335,7 +335,7 @@ def report_sent_event_from_message_sent(work_id: str, payload: dict[str, Any], s
     pending_at = parse_time(pending.get("observed_at"))
     if not pending_at or time.time() - pending_at > PENDING_COMPLETION_REPORT_PROOF_WINDOW_SECONDS:
         return None
-    if pending_tool_use_id and payload_tool_use_id and payload_tool_use_id != pending_tool_use_id:
+    if pending_tool_use_id and payload_tool_use_id != pending_tool_use_id:
         return None
     delivery_message_id = delivery_message_id_from_payload(payload)
     if not delivery_message_id:
@@ -360,6 +360,34 @@ def report_sent_event_from_message_sent(work_id: str, payload: dict[str, Any], s
         "hook_observations": [observation],
         "hook_fingerprints": [observation["fingerprint"]],
     }
+
+
+def possible_unrecorded_completion_delivery(state: dict[str, Any]) -> dict[str, Any] | None:
+    expected = canonical_visible_delivery_route(
+        state.get("completion_visible_delivery") or state.get("visible_delivery") or {}
+    )
+    if not expected:
+        return None
+    expected_delivery = {key: value for key, value in expected.items() if key != "session_key"}
+    owner_session = state.get("owner_session_key")
+    for observation in reversed(state.get("hook_observations") or []):
+        if observation.get("candidate_event_type") != "visible_update_sent":
+            continue
+        payload = observation.get("redacted_payload") or {}
+        if payload.get("type") != "message" or payload.get("action") != "sent":
+            continue
+        if not payload_session_matches_owner(payload, owner_session):
+            continue
+        if delivery_route_without_session(payload) != expected_delivery:
+            continue
+        message_id = delivery_message_id_from_payload(payload)
+        return {
+            "message_id": message_id,
+            "fingerprint": observation.get("fingerprint"),
+            "payload_hash": observation.get("payload_hash"),
+            "route": expected_delivery,
+        }
+    return None
 
 
 def validate_owner_session_key(value: str | None) -> str:
@@ -1084,12 +1112,20 @@ def is_stale(state: dict[str, Any], now_ts: float, thresholds: dict[str, int]) -
 def make_recovery_packet(root: Path, state: dict[str, Any], reason: str) -> dict[str, Any]:
     status = state.get("status")
     context_gaps = recovery_context_gaps(state)
+    possible_delivery = possible_unrecorded_completion_delivery(state)
     if reason == "insufficient_recovery_context":
         recovery_instruction = (
             "This ledger entry lacks enough durable context for confident recovery. "
             "Do not guess the original request or repeat side effects. Inspect the ledger events, "
             "current artifacts/tasks/subagents; then either "
             "repair the ledger with explicit context, ask the user for the missing decision, or mark the work blocked/abandoned."
+        )
+    elif status in ACTIVE_STATES.union(UNREPORTED_TERMINAL_STATES) and possible_delivery:
+        recovery_instruction = (
+            "A matching visible message delivery was observed, but completion/report proof was not recorded. "
+            "Do not blindly send another completion report. Reconcile the current conversation and ledger events first. "
+            "If the observed message was the final completion report, record complete-reported with its delivery id; "
+            "otherwise continue the next safe action, verify, send one visible completion report, then record complete-reported."
         )
     elif status == "waiting_user":
         recovery_instruction = (
@@ -1138,6 +1174,7 @@ def make_recovery_packet(root: Path, state: dict[str, Any], reason: str) -> dict
         "last_material_event": state.get("last_material_event"),
         "visible_delivery": visible_delivery_route,
         "visible_delivery_proof": state.get("visible_delivery_proof", {}),
+        "possible_unrecorded_completion_delivery": possible_delivery,
         "user_message_timestamp": state.get("user_message_timestamp"),
         "last_visible_update_at": state.get("last_visible_update_at"),
         "last_wait_reminder_at": state.get("last_wait_reminder_at"),
