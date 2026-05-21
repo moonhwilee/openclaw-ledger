@@ -66,6 +66,22 @@ def assert_true(value: Any, message: str) -> None:
         raise AssertionError(message)
 
 
+def smoke_json_flag_compatibility() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="work-ledger-smoke-") as tmp:
+        root = Path(tmp)
+        scan_after_subcommand = run(root, "scan", "--json", "--cooldown-seconds", "0")
+        state_after_subcommand = run(root, "state", "--json")
+        scan_before_subcommand = run(root, "--json", "scan", "--cooldown-seconds", "0")
+        assert_true(scan_after_subcommand["ok"] is True, "scan --json should be accepted")
+        assert_true(state_after_subcommand["ok"] is True, "state --json should be accepted")
+        assert_true(scan_before_subcommand["ok"] is True, "--json scan should be accepted")
+        return {
+            "scan_after_subcommand": scan_after_subcommand["ok"],
+            "state_after_subcommand": state_after_subcommand["ok"],
+            "scan_before_subcommand": scan_before_subcommand["ok"],
+        }
+
+
 def age_events(root: Path, work_id: str, seconds: int) -> None:
     path = root / "state" / "work-ledger" / "events.jsonl"
     events = []
@@ -2253,6 +2269,7 @@ def main() -> int:
     result = {
         "ok": True,
         "smokes": {
+            "json_flag_compatibility": smoke_json_flag_compatibility(),
             "recovery_report_path": smoke_recovery_report_path(),
             "report_sent_requires_delivery": smoke_report_sent_requires_delivery(),
             "message_sent_hook_records_report_proof": smoke_message_sent_hook_records_report_proof(),
