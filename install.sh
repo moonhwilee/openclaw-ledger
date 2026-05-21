@@ -308,7 +308,6 @@ config = {
     },
     "launch_agent_label": sys.argv[9],
     "interval_seconds": int(sys.argv[10]),
-    "wake_suppression_seconds": 1800,
 }
 config_path.parent.mkdir(parents=True, exist_ok=True)
 tmp = config_path.with_suffix(config_path.suffix + ".tmp")

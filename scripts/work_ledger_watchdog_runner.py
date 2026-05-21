@@ -44,7 +44,15 @@ STATE_PATH = Path(os.environ.get("OPENCLAW_LEDGER_STATE_PATH", "~/.openclaw/ledg
 PROMPT_PATH = DEFAULT_PROMPT_PATH
 SESSION_KEY = os.environ.get("OPENCLAW_LEDGER_OWNER_SESSION_KEY") or ""
 VISIBLE_DELIVERY: dict[str, Any] = {}
-WAKE_SUPPRESSION_SECONDS = 30 * 60
+FALLBACK_WAKE_PROMPT = """# Work Ledger Watchdog v1 Wake Handler
+
+Priority:
+- Treat this system event as recovery work before answering ordinary chat context.
+- Inspect the included watchdog-check JSON and reconcile unfinished Ledger work.
+- Do not repeat external or destructive side effects without explicit user approval.
+- Send a visible completion, waiting, or blocked report only after the safe recovery action is clear.
+- Record durable Ledger proof after acting, such as wake-delivered, wait-reminder-sent, terminal-ref-handled, or complete-reported.
+"""
 
 
 def usage() -> str:
@@ -107,7 +115,7 @@ def path_from_config(config: dict[str, Any], key: str, default: Path) -> Path:
 
 
 def load_config() -> None:
-    global WORKSPACE, LEDGER, OPENCLAW, STATE_PATH, PROMPT_PATH, SESSION_KEY, VISIBLE_DELIVERY, WAKE_SUPPRESSION_SECONDS
+    global WORKSPACE, LEDGER, OPENCLAW, STATE_PATH, PROMPT_PATH, SESSION_KEY, VISIBLE_DELIVERY
     config = load_json(DEFAULT_CONFIG_PATH, {})
     if not isinstance(config, dict):
         config = {}
@@ -126,10 +134,6 @@ def load_config() -> None:
     )
     visible = config.get("visible_delivery") or {}
     VISIBLE_DELIVERY = visible if isinstance(visible, dict) else {}
-    try:
-        WAKE_SUPPRESSION_SECONDS = int(config.get("wake_suppression_seconds", WAKE_SUPPRESSION_SECONDS))
-    except Exception:
-        WAKE_SUPPRESSION_SECONDS = 30 * 60
 
 
 def run(cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
@@ -165,7 +169,14 @@ def stable_signature(result: dict[str, Any]) -> str:
 
 
 def wake_prompt(result: dict[str, Any]) -> str:
-    base = PROMPT_PATH.read_text(encoding="utf-8")
+    try:
+        base = PROMPT_PATH.read_text(encoding="utf-8")
+    except Exception as exc:
+        result = {
+            **result,
+            "runner_prompt_error": f"failed to read watchdog prompt {PROMPT_PATH}: {exc}",
+        }
+        base = FALLBACK_WAKE_PROMPT
     return (
         base
         + "\n\n---\n\n"
@@ -187,6 +198,7 @@ def main() -> int:
         return 2
     os.environ["PATH"] = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
     load_config()
+    os.environ["OPENCLAW_BIN"] = str(OPENCLAW)
     state = load_json(STATE_PATH, {})
     started_at = now_iso()
     try:
@@ -244,13 +256,11 @@ def main() -> int:
 
     signature = stable_signature(result)
     now_ts = time.time()
-    last_wake_ts = float(state.get("last_wake_ts") or 0)
-    last_wake_succeeded = state.get("last_wake_returncode") == 0
-    if last_wake_succeeded and state.get("last_wake_signature") == signature and now_ts - last_wake_ts < WAKE_SUPPRESSION_SECONDS:
-        state["last_suppressed_at"] = now_iso()
-        state["last_suppressed_signature"] = signature
-        save_json(STATE_PATH, state)
-        return 0
+    # Do not treat delivery to the main session as successful recovery.
+    # Durable ledger records such as wake-delivered, terminal-ref-handled,
+    # wait-reminder-sent, or complete-reported are the suppression mechanism.
+    # If the main session fails to reconcile a recovery packet, the next
+    # deterministic check must be allowed to wake it again.
 
     try:
         prompt = wake_prompt(result)

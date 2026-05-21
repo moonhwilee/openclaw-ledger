@@ -96,6 +96,11 @@ does not count as user-visible proof and must not refresh activity by itself.
 Only a `visible-update` or `wait-reminder-sent` with both a visible delivery
 route and delivery message id can refresh the visible-wait clock.
 
+Visible coding and local-file work has a shorter default stale threshold than
+generic active work when registered through `quick-start`: coding uses 12
+minutes and local-files uses 15 minutes. This keeps user-visible implementation
+work responsive without changing the slower `waiting_user` policy.
+
 ## Selective Registration Policy
 
 Do not register every user turn. Work Ledger is for work with durable recovery
@@ -156,13 +161,19 @@ python3 src/work_ledger.py quick-start \
 
 On recovery, the main session should:
 
-1. Read the ledger entry and latest events.
-2. Inspect current artifacts, tasks, and subagents.
-3. Avoid repeating external, destructive, or non-idempotent actions without approval.
-4. Execute only the next safe action.
-5. Verify the result.
-6. Send one visible completion report.
-7. Record that the report was sent.
+1. Reconcile the watchdog result before answering unrelated chat context.
+2. Read the ledger entry and latest events.
+3. Inspect current artifacts, tasks, and subagents.
+4. Avoid repeating external, destructive, or non-idempotent actions without approval.
+5. Execute only the next safe action.
+6. Verify the result.
+7. Send one visible completion report.
+8. Record that the report was sent.
+
+The runner may record that a wake event was delivered, but delivery alone is not
+recovery. Repeat suppression must come from durable ledger outcomes such as
+`wake-delivered`, `terminal-ref-handled`, `wait-reminder-sent`, or
+`complete-reported`, not from a successful `openclaw system event` call.
 
 ### 2026-05-18 Watchdog Smoke Results
 
@@ -301,10 +312,12 @@ It is intentionally small:
 - load local config from `OPENCLAW_LEDGER_CONFIG` or
   `~/.openclaw/ledger/config.json`
 - run `openclaw-ledger watchdog-check --include-cron`
+- pass the configured `openclaw_path` to ledger task lookups through
+  `OPENCLAW_BIN`
 - return silently when the result is clean
 - wake the configured main session only for non-clean results
-- suppress duplicate wakeups for the same non-clean signature after a successful
-  wake
+- record wake attempt metadata, but do not suppress unresolved repeat wakeups
+  solely because event delivery succeeded
 
 For diagnostics:
 
