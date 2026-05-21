@@ -2046,11 +2046,26 @@ def add_common_event_args(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Workspace-local recoverable work ledger")
+    json_parent = argparse.ArgumentParser(add_help=False)
+    json_parent.add_argument(
+        "--json",
+        action="store_true",
+        help="Output JSON. Accepted for wrapper compatibility; ledger commands already emit JSON.",
+    )
+
+    parser = argparse.ArgumentParser(
+        description="Workspace-local recoverable work ledger",
+        parents=[json_parent],
+    )
     parser.add_argument("--root", default=str(DEFAULT_ROOT), help="Workspace root")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    start = sub.add_parser("start")
+    def add_command(name: str, **kwargs: Any) -> argparse.ArgumentParser:
+        parents = list(kwargs.pop("parents", []))
+        parents.append(json_parent)
+        return sub.add_parser(name, parents=parents, **kwargs)
+
+    start = add_command("start")
     add_common_event_args(start)
     start.add_argument("--request-summary", required=True)
     start.add_argument("--owner-session-key")
@@ -2069,7 +2084,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--resume-start", action="store_true", help="Allow another start event for an active work_id")
     start.add_argument("--visible-delivery")
 
-    quick = sub.add_parser("quick-start", help="Start a selective ledger entry from a small preset; not for every short request")
+    quick = add_command("quick-start", help="Start a selective ledger entry from a small preset; not for every short request")
     quick.add_argument("--kind", required=True, choices=sorted(QUICK_START_PRESETS))
     quick.add_argument("--summary", required=True)
     quick.add_argument("--work-id")
@@ -2097,7 +2112,7 @@ def build_parser() -> argparse.ArgumentParser:
     quick.add_argument("--resume-start", action="store_true")
 
     for name in ("progress", "wait", "verify", "complete", "fail", "visible-update", "wait-reminder-sent", "report-sent", "abandon"):
-        cmd = sub.add_parser(name)
+        cmd = add_command(name)
         add_common_event_args(cmd)
         if name == "wait":
             cmd.add_argument("--status", choices=["waiting_subagent", "waiting_user"], default="waiting_subagent")
@@ -2107,46 +2122,46 @@ def build_parser() -> argparse.ArgumentParser:
             cmd.add_argument("--visible-delivery")
             cmd.add_argument("--delivery-message-id")
 
-    complete_reported = sub.add_parser("complete-reported", help="Record completion and final visible report proof in one locked operation")
+    complete_reported = add_command("complete-reported", help="Record completion and final visible report proof in one locked operation")
     add_common_event_args(complete_reported)
     complete_reported.add_argument("--visible-delivery", required=True)
     complete_reported.add_argument("--delivery-message-id", required=True)
     complete_reported.add_argument("--report-note")
 
-    state = sub.add_parser("state")
+    state = add_command("state")
     state.add_argument("--work-id")
 
-    scan = sub.add_parser("scan")
+    scan = add_command("scan")
     scan.add_argument("--cooldown-seconds", type=int, default=30 * 60)
     scan.add_argument("--record-wake", action="store_true", help="Deprecated no-op; record wake only after delivery with wake-delivered")
 
-    orphans = sub.add_parser("orphans", help="Read-only reconciliation check for active OpenClaw tasks not referenced by active ledger entries")
+    orphans = add_command("orphans", help="Read-only reconciliation check for active OpenClaw tasks not referenced by active ledger entries")
     orphans.add_argument("--include-cron", action="store_true", help="Include cron tasks in orphan reconciliation")
     orphans.add_argument("--min-age-seconds", type=int, default=DEFAULT_ORPHAN_MIN_AGE_SECONDS, help="Only report active tasks at least this old; use 0 for all")
 
-    watchdog = sub.add_parser("watchdog-check", help="Fast deterministic watchdog triage; clean exits need no LLM")
+    watchdog = add_command("watchdog-check", help="Fast deterministic watchdog triage; clean exits need no LLM")
     watchdog.add_argument("--include-cron", action="store_true", help="Include cron tasks in orphan reconciliation")
     watchdog.add_argument("--min-age-seconds", type=int, default=DEFAULT_ORPHAN_MIN_AGE_SECONDS, help="Only report active tasks at least this old; use 0 for all")
     watchdog.add_argument("--cooldown-seconds", type=int, default=30 * 60, help="Recovery packet cooldown")
 
-    prune = sub.add_parser("prune-terminal", help="Prune old reported/abandoned terminal work; dry-run by default")
+    prune = add_command("prune-terminal", help="Prune old reported/abandoned terminal work; dry-run by default")
     prune.add_argument("--days", type=int, default=DEFAULT_TERMINAL_RETENTION_DAYS)
     prune.add_argument("--apply", action="store_true", help="Actually remove matching terminal work and compact events")
 
-    orphan_warning = sub.add_parser("orphan-warning-sent", help="Suppress repeat warnings for a reported orphan fingerprint")
+    orphan_warning = add_command("orphan-warning-sent", help="Suppress repeat warnings for a reported orphan fingerprint")
     orphan_warning.add_argument("--orphan-fingerprint", required=True)
     orphan_warning.add_argument("--orphan-fingerprints", help="JSON array of equivalent orphan fingerprints to suppress together")
     orphan_warning.add_argument("--visible-delivery", required=True)
     orphan_warning.add_argument("--delivery-message-id", required=True)
     orphan_warning.add_argument("--note")
 
-    orphan_handled = sub.add_parser("orphan-handled", help="Suppress a reconciled orphan that required no user-visible message")
+    orphan_handled = add_command("orphan-handled", help="Suppress a reconciled orphan that required no user-visible message")
     orphan_handled.add_argument("--orphan-fingerprint", required=True)
     orphan_handled.add_argument("--orphan-fingerprints", help="JSON array of equivalent orphan fingerprints to suppress together")
     orphan_handled.add_argument("--resolution", required=True, choices=sorted(ORPHAN_HANDLED_RESOLUTIONS))
     orphan_handled.add_argument("--note", required=True)
 
-    terminal_ref_handled = sub.add_parser("terminal-ref-handled", help="Suppress a reconciled terminal task/subagent reference without completing the work")
+    terminal_ref_handled = add_command("terminal-ref-handled", help="Suppress a reconciled terminal task/subagent reference without completing the work")
     terminal_ref_handled.add_argument("--work-id", required=True)
     terminal_ref_handled.add_argument("--ref", required=True)
     terminal_ref_handled.add_argument("--terminal-status", required=True)
@@ -2154,22 +2169,22 @@ def build_parser() -> argparse.ArgumentParser:
     terminal_ref_handled.add_argument("--terminal-ref-fingerprints", help="JSON array of equivalent terminal ref fingerprints to suppress together")
     terminal_ref_handled.add_argument("--note", required=True)
 
-    wake = sub.add_parser("wake-delivered")
+    wake = add_command("wake-delivered")
     wake.add_argument("--work-id", required=True)
     wake.add_argument("--recovery-fingerprint", required=True)
     wake.add_argument("--note")
 
-    hook_observe = sub.add_parser("hook-observe")
+    hook_observe = add_command("hook-observe")
     hook_observe.add_argument("--work-id", required=True)
     hook_observe.add_argument("--payload", required=True, help="Hook payload JSON object")
     hook_observe.add_argument("--note")
     hook_observe.add_argument("--next-recovery-action")
 
-    hook_guardrail = sub.add_parser("hook-guardrail")
+    hook_guardrail = add_command("hook-guardrail")
     hook_guardrail.add_argument("--work-id", required=True)
     hook_guardrail.add_argument("--payload", required=True, help="Hook payload JSON object")
 
-    sub.add_parser("rebuild")
+    add_command("rebuild")
     return parser
 
 
