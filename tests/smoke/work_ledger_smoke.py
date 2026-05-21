@@ -72,13 +72,91 @@ def smoke_json_flag_compatibility() -> dict[str, Any]:
         scan_after_subcommand = run(root, "scan", "--json", "--cooldown-seconds", "0")
         state_after_subcommand = run(root, "state", "--json")
         scan_before_subcommand = run(root, "--json", "scan", "--cooldown-seconds", "0")
+        watchdog_after_subcommand = run(root, "watchdog-check", "--json", "--cooldown-seconds", "0", "--min-age-seconds", "0")
+        orphans_after_subcommand = run(root, "orphans", "--json", "--min-age-seconds", "0")
+        prune_after_subcommand = run(root, "prune-terminal", "--json", "--days", "1")
+        matrix_work_id = "smoke-json-compat-matrix"
+        visible_delivery = json.dumps({"channel": "telegram", "target": "test-user"})
+        start_after_subcommand = run(
+            root,
+            "start",
+            "--json",
+            "--work-id",
+            matrix_work_id,
+            "--owner-session-key",
+            "agent:main:telegram:direct:test-user",
+            "--visible-delivery",
+            visible_delivery,
+            "--request-summary",
+            "Smoke test json flag matrix",
+            "--side-effect-class",
+            "local_files",
+            "--no-artifact-expected",
+            "--checklist",
+            json.dumps(["start", "complete-reported"]),
+            "--success-criteria",
+            json.dumps(["json flag accepted after lifecycle subcommands"]),
+        )
+        complete_reported_after_subcommand = run(
+            root,
+            "complete-reported",
+            "--json",
+            "--work-id",
+            matrix_work_id,
+            "--visible-delivery",
+            visible_delivery,
+            "--delivery-message-id",
+            "json-compat-message",
+        )
+        hook_work_id = "smoke-json-compat-hook"
+        run(
+            root,
+            "--json",
+            "start",
+            "--work-id",
+            hook_work_id,
+            "--owner-session-key",
+            "agent:main:telegram:direct:test-user",
+            "--visible-delivery",
+            visible_delivery,
+            "--request-summary",
+            "Smoke test hook json flag",
+            "--side-effect-class",
+            "local_files",
+            "--no-artifact-expected",
+            "--checklist",
+            json.dumps(["hook-observe"]),
+            "--success-criteria",
+            json.dumps(["hook-observe accepts json after subcommand"]),
+        )
+        hook_observe_after_subcommand = run(
+            root,
+            "hook-observe",
+            "--json",
+            "--work-id",
+            hook_work_id,
+            "--payload",
+            json.dumps({"hook_event_name": "PostToolUse", "tool_name": "test", "tool_use_id": "tool-json"}),
+        )
         assert_true(scan_after_subcommand["ok"] is True, "scan --json should be accepted")
         assert_true(state_after_subcommand["ok"] is True, "state --json should be accepted")
         assert_true(scan_before_subcommand["ok"] is True, "--json scan should be accepted")
+        assert_true("status" in watchdog_after_subcommand, "watchdog-check --json should be accepted")
+        assert_true("has_orphans" in orphans_after_subcommand, "orphans --json should be accepted")
+        assert_true(prune_after_subcommand["ok"] is True, "prune-terminal --json should be accepted")
+        assert_true(start_after_subcommand["ok"] is True, "start --json should be accepted")
+        assert_true(complete_reported_after_subcommand["report_event"]["event_type"] == "report_sent", "complete-reported --json should be accepted")
+        assert_true(hook_observe_after_subcommand["ok"] is True, "hook-observe --json should be accepted")
         return {
             "scan_after_subcommand": scan_after_subcommand["ok"],
             "state_after_subcommand": state_after_subcommand["ok"],
             "scan_before_subcommand": scan_before_subcommand["ok"],
+            "watchdog_after_subcommand": "status" in watchdog_after_subcommand,
+            "orphans_after_subcommand": "has_orphans" in orphans_after_subcommand,
+            "prune_after_subcommand": prune_after_subcommand["ok"],
+            "start_after_subcommand": start_after_subcommand["ok"],
+            "complete_reported_after_subcommand": complete_reported_after_subcommand["report_event"]["event_type"] == "report_sent",
+            "hook_observe_after_subcommand": hook_observe_after_subcommand["ok"],
         }
 
 
@@ -548,6 +626,24 @@ def smoke_message_sent_hook_records_report_proof() -> dict[str, Any]:
         no_session_state = run(root, "state", "--work-id", work_id)["items"][0]
         assert_true(no_session.get("recorded_report_sent") is not True, "message:sent without owner session must not close report proof")
         assert_true(no_session_state["status"] == "completed_unreported", "missing session should leave work unreported")
+        missing_tool_id = run(
+            root,
+            "hook-observe",
+            "--work-id",
+            work_id,
+            "--payload",
+            json.dumps({
+                "type": "message",
+                "action": "sent",
+                "channel": "telegram",
+                "target": "test-user",
+                "sessionKey": "agent:main:telegram:direct:test-user",
+                "messageId": "missing-tool-id-message",
+            }),
+        )
+        missing_tool_id_state = run(root, "state", "--work-id", work_id)["items"][0]
+        assert_true(missing_tool_id.get("recorded_report_sent") is not True, "message:sent without the pending tool_use_id must not close report proof")
+        assert_true(missing_tool_id_state["status"] == "completed_unreported", "missing tool_use_id should leave work unreported")
 
         proof = run(
             root,
@@ -598,10 +694,125 @@ def smoke_message_sent_hook_records_report_proof() -> dict[str, Any]:
             "send_attempt_recorded": send_attempt.get("recorded_completion_report_send") is True,
             "wrong_tool_use_id_ignored": mismatch_state["status"] == "completed_unreported",
             "missing_session_ignored": no_session_state["status"] == "completed_unreported",
+            "missing_tool_use_id_ignored": missing_tool_id_state["status"] == "completed_unreported",
             "message_sent_recorded_report": proof.get("recorded_report_sent") is True,
             "duplicate_message_sent_deduped": duplicate.get("duplicate") is True,
             "final_status": reported_state["status"],
             "scan_clean": not scan["has_recoveries"],
+        }
+
+
+def smoke_active_visible_delivery_recovery_reconciles_before_duplicate() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="work-ledger-smoke-") as tmp:
+        root = Path(tmp)
+        work_id = "smoke-active-visible-delivery-recovery"
+        visible_delivery = json.dumps({"channel": "telegram", "target": "test-user"})
+        run(
+            root,
+            "start",
+            "--work-id",
+            work_id,
+            "--owner-session-key",
+            "agent:main:telegram:direct:test-user",
+            "--visible-delivery",
+            visible_delivery,
+            "--request-summary",
+            "Smoke test active visible delivery recovery packet",
+            "--side-effect-class",
+            "local_files",
+            "--no-artifact-expected",
+            "--stale-after-seconds",
+            "300",
+            "--expected-outputs",
+            "visible report",
+            "--checklist",
+            json.dumps(["send visible final", "record proof"]),
+            "--success-criteria",
+            json.dumps(["recovery reconciles observed delivery before duplicate"]),
+        )
+        sent = run(
+            root,
+            "hook-observe",
+            "--work-id",
+            work_id,
+            "--payload",
+            json.dumps({
+                "type": "message",
+                "action": "sent",
+                "channel": "telegram",
+                "target": "test-user",
+                "sessionKey": "agent:main:telegram:direct:test-user",
+                "messageId": "active-visible-message",
+            }),
+        )
+        age_events(root, work_id, seconds=301)
+        scan = run(root, "scan", "--cooldown-seconds", "0")
+        packet = next(item for item in scan["recoveries"] if item["work_id"] == work_id)
+        possible_delivery = packet.get("possible_unrecorded_completion_delivery") or {}
+        instruction = packet.get("required_recovery_instruction") or ""
+        assert_true(sent.get("recorded_report_sent") is not True, "active visible delivery must not close proof automatically")
+        assert_true(possible_delivery.get("message_id") == "active-visible-message", "recovery packet should expose the observed delivery id")
+        assert_true("Do not blindly send another completion report" in instruction, "recovery should warn before duplicate report")
+        return {
+            "message_id": possible_delivery.get("message_id"),
+            "status": packet.get("status"),
+            "warns_before_duplicate": "Do not blindly send another completion report" in instruction,
+        }
+
+
+def smoke_terminal_visible_delivery_recovery_reconciles_before_duplicate() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="work-ledger-smoke-") as tmp:
+        root = Path(tmp)
+        work_id = "smoke-terminal-visible-delivery-recovery"
+        visible_delivery = json.dumps({"channel": "telegram", "target": "test-user"})
+        run(
+            root,
+            "start",
+            "--work-id",
+            work_id,
+            "--owner-session-key",
+            "agent:main:telegram:direct:test-user",
+            "--visible-delivery",
+            visible_delivery,
+            "--request-summary",
+            "Smoke test terminal visible delivery recovery packet",
+            "--side-effect-class",
+            "local_files",
+            "--no-artifact-expected",
+            "--expected-outputs",
+            "visible report",
+            "--checklist",
+            json.dumps(["complete", "send visible final", "record proof"]),
+            "--success-criteria",
+            json.dumps(["terminal recovery reconciles observed delivery before duplicate"]),
+        )
+        run(root, "complete", "--work-id", work_id, "--note", "finished before report proof")
+        sent = run(
+            root,
+            "hook-observe",
+            "--work-id",
+            work_id,
+            "--payload",
+            json.dumps({
+                "type": "message",
+                "action": "sent",
+                "channel": "telegram",
+                "target": "test-user",
+                "sessionKey": "agent:main:telegram:direct:test-user",
+                "messageId": "terminal-visible-message",
+            }),
+        )
+        scan = run(root, "scan", "--cooldown-seconds", "0")
+        packet = next(item for item in scan["recoveries"] if item["work_id"] == work_id)
+        possible_delivery = packet.get("possible_unrecorded_completion_delivery") or {}
+        instruction = packet.get("required_recovery_instruction") or ""
+        assert_true(sent.get("recorded_report_sent") is not True, "unbound terminal visible delivery must not close proof automatically")
+        assert_true(possible_delivery.get("message_id") == "terminal-visible-message", "recovery packet should expose observed terminal delivery id")
+        assert_true("Do not blindly send another completion report" in instruction, "terminal recovery should warn before duplicate report")
+        return {
+            "message_id": possible_delivery.get("message_id"),
+            "status": packet.get("status"),
+            "warns_before_duplicate": "Do not blindly send another completion report" in instruction,
         }
 
 
@@ -2274,6 +2485,8 @@ def main() -> int:
             "report_sent_requires_delivery": smoke_report_sent_requires_delivery(),
             "message_sent_hook_records_report_proof": smoke_message_sent_hook_records_report_proof(),
             "message_sent_without_tool_use_id_is_time_bounded": smoke_message_sent_without_tool_use_id_is_time_bounded(),
+            "active_visible_delivery_recovery_reconciles_before_duplicate": smoke_active_visible_delivery_recovery_reconciles_before_duplicate(),
+            "terminal_visible_delivery_recovery_reconciles_before_duplicate": smoke_terminal_visible_delivery_recovery_reconciles_before_duplicate(),
             "referenced_codex_uuid_not_terminal_task_lookup": smoke_referenced_codex_uuid_not_terminal_task_lookup(),
             "visible_update_route_does_not_contaminate_report_route": smoke_visible_update_route_does_not_contaminate_report_route(),
             "report_sent_rejects_active_work": smoke_report_sent_rejects_active_work(),

@@ -61,15 +61,24 @@ and LLM-generated payloads should not supply their own keys.
 5. Send the visible completion report after the requested outcome is handled.
 6. Record completion and report proof.
 
-Prefer `complete-reported` only after a successful visible report send has
-returned a delivery id. It records `complete` and `report_sent` in one locked
-batch, preserving the strict proof model while reducing the chance of leaving
-finished work in `completed_unreported`. It does not send the message itself.
-For an entry that is already `completed_unreported` or `failed_unreported`, the
-same command records only the final report proof and does not rewrite the prior
-terminal event. Keep using separate `complete`/`fail` and `report-sent` only
-when the send and proof arrive through separate hook telemetry or when you are
-explicitly repairing older ledger history.
+The most crash-resilient path is: record `complete` or `fail`, send the visible
+completion report, then record `report-sent` with the delivered message id. Hook
+telemetry may also record that proof automatically after the terminal event.
+This order means a crash after the visible send leaves durable
+`completed_unreported` or `failed_unreported` state that recovery can close
+without guessing whether the work was done.
+
+`complete-reported` is a shortcut for cases where a successful visible report
+send has already returned a delivery id and hook telemetry did not close the
+proof. It records `complete` and `report_sent` in one locked batch for active
+work. Because it runs after the visible send, a crash before this command can
+leave an active entry with an observed visible delivery but no final proof; in
+that case recovery must reconcile the conversation and delivery id before
+sending another completion report.
+
+For an entry that is already `completed_unreported` or `failed_unreported`,
+`complete-reported` records only the final report proof and does not rewrite the
+prior terminal event.
 
 For GoalFlow approval pauses, the visible approval request/update and the
 Ledger wait state are both required. GoalFlow uses `waiting_approval` /
@@ -229,7 +238,10 @@ reconciliation input gathering, then returns one of:
 - `clean`: no LLM/user-visible work is needed.
 - `needs_wake` with `wake_reason=recovery`: process recovery packets, verify,
   send one visible completion report, then record `complete-reported` with the
-  delivered message id. Use `report-sent` only for an already-unreported
+  delivered message id. If the packet includes a possible unrecorded visible
+  completion delivery, reconcile that delivery first and avoid sending a
+  duplicate report; if it was the final report, record `complete-reported` with
+  the observed delivery id. Use `report-sent` only for an already-unreported
   terminal item or hook-driven proof repair.
 - `needs_wake` with `wake_reason=referenced_task_reconciliation`: inspect
   ledger-referenced terminal tasks/subagents, integrate their result or report
