@@ -4,13 +4,21 @@ This is the main-session wake handler for non-clean watchdog results. The clean
 path is handled by the deterministic LaunchAgent runner and must not wake the
 LLM.
 
+Priority:
+- Treat this system event as recovery work, not as a normal user question.
+- Before answering any ordinary chat message in the same session, reconcile the
+  included watchdog result and record the required durable ledger outcome.
+- The only exception is an explicit newer user instruction to stop, pause, or
+  abandon the recovery; record that state before replying to the user.
+
 Commands:
 ```bash
 openclaw-ledger watchdog-check --include-cron
 ```
 
 Procedure:
-1. Inspect the precomputed watchdog-check result included in this system event.
+1. Inspect the precomputed watchdog-check result included in this system event
+   before responding to unrelated chat context.
    Rerun `watchdog-check --include-cron` only when the included evidence is
    missing, stale, or suspicious.
 2. If a rerun returns `status=clean`, reply exactly `HEARTBEAT_OK`. Do not
@@ -56,9 +64,11 @@ Procedure:
    blocked, do not send repeated reminders every tick. First record the
    substantive durable outcome (`wait`, `wait-reminder-sent`, or `abandon`) or
    send the visible update if one is required. Do not use silent `progress` to
-   refresh a `waiting_user` recovery. Record `wake-delivered` with the packet
-   `recovery_fingerprint` only after that durable state transition or visible
-   update succeeds.
+   refresh a `waiting_user` recovery. For `waiting_user`, send a reminder only
+   when the packet is stale enough and no recent reminder proof exists; after a
+   visible reminder succeeds, record `wait-reminder-sent` with the delivery id.
+   Record `wake-delivered` with the packet `recovery_fingerprint` only after
+   that durable state transition or visible update succeeds.
 7. If a packet has context gaps, do not invent the request. Repair the ledger
    context, ask the user only for a real missing decision, or mark
    blocked/abandoned.

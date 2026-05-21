@@ -116,6 +116,8 @@ MIN_STALE_AFTER_SECONDS = {
     "waiting_user": 60 * 60,
     "verifying": 5 * 60,
 }
+VISIBLE_CODING_STALE_SECONDS = 12 * 60
+VISIBLE_LOCAL_FILES_STALE_SECONDS = 15 * 60
 
 
 def now_iso() -> str:
@@ -1200,7 +1202,11 @@ def scan_recoveries(root: Path, cooldown_seconds: int) -> list[dict[str, Any]]:
         stale, reason = is_stale(state, now_ts, DEFAULT_THRESHOLDS_SECONDS)
         if not stale:
             continue
-        if recovery_context_gaps(state):
+        if state.get("status") in UNREPORTED_TERMINAL_STATES:
+            pass
+        elif state.get("status") == "waiting_user" and reason.startswith("waiting_user_stale_"):
+            pass
+        elif recovery_context_gaps(state):
             reason = "insufficient_recovery_context"
         packet = make_recovery_packet(root, state, reason)
         last_fingerprint = state.get("last_recovery_fingerprint")
@@ -1653,6 +1659,24 @@ def watchdog_check(
     min_age_seconds: int = DEFAULT_ORPHAN_MIN_AGE_SECONDS,
     cooldown_seconds: int = 30 * 60,
 ) -> dict[str, Any]:
+    recoveries = scan_recoveries(root, cooldown_seconds)
+    terminal_recoveries = [
+        item
+        for item in recoveries
+        if isinstance(item, dict) and item.get("reason") in UNREPORTED_TERMINAL_STATES
+    ]
+    if terminal_recoveries:
+        return {
+            "ok": True,
+            "status": "needs_wake",
+            "needs_wake": True,
+            "wake_reason": "recovery",
+            "recoveries": terminal_recoveries,
+            "terminal_refs": {"ok": True, "has_terminal_refs": False, "terminal_refs": [], "ignored": [], "errors": []},
+            "orphans": None,
+            "policy": "LLM must deliver or reconcile unreported completion/failure before terminal task reconciliation; do not retry risky side effects",
+        }
+
     terminal_refs = find_referenced_terminal_tasks(root)
     if not terminal_refs.get("ok", False):
         return {
@@ -1678,7 +1702,6 @@ def watchdog_check(
             "policy": "LLM must reconcile referenced terminal tasks by integrating results or reporting failure; do not restart or repeat side effects from this signal alone",
         }
 
-    recoveries = scan_recoveries(root, cooldown_seconds)
     if recoveries:
         return {
             "ok": True,
@@ -1736,14 +1759,14 @@ QUICK_START_PRESETS: dict[str, dict[str, Any]] = {
         "side_effect_class": "repo_changes",
         "checklist": ["inspect current state", "make scoped code changes", "run verification", "send visible completion report"],
         "success_criteria": ["requested code change is complete", "verification result is recorded", "visible report is sent"],
-        "stale_after_seconds": 30 * 60,
+        "stale_after_seconds": VISIBLE_CODING_STALE_SECONDS,
         "repeat_policy": "reconcile_first",
     },
     "local-files": {
         "side_effect_class": "local_files",
         "checklist": ["inspect current files", "make scoped file changes", "verify result", "send visible completion report"],
         "success_criteria": ["requested file work is complete", "verification result is recorded", "visible report is sent"],
-        "stale_after_seconds": 30 * 60,
+        "stale_after_seconds": VISIBLE_LOCAL_FILES_STALE_SECONDS,
         "repeat_policy": "reconcile_first",
     },
     "subagent": {

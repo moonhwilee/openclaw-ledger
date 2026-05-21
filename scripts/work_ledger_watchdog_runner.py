@@ -44,7 +44,6 @@ STATE_PATH = Path(os.environ.get("OPENCLAW_LEDGER_STATE_PATH", "~/.openclaw/ledg
 PROMPT_PATH = DEFAULT_PROMPT_PATH
 SESSION_KEY = os.environ.get("OPENCLAW_LEDGER_OWNER_SESSION_KEY") or ""
 VISIBLE_DELIVERY: dict[str, Any] = {}
-WAKE_SUPPRESSION_SECONDS = 30 * 60
 
 
 def usage() -> str:
@@ -107,7 +106,7 @@ def path_from_config(config: dict[str, Any], key: str, default: Path) -> Path:
 
 
 def load_config() -> None:
-    global WORKSPACE, LEDGER, OPENCLAW, STATE_PATH, PROMPT_PATH, SESSION_KEY, VISIBLE_DELIVERY, WAKE_SUPPRESSION_SECONDS
+    global WORKSPACE, LEDGER, OPENCLAW, STATE_PATH, PROMPT_PATH, SESSION_KEY, VISIBLE_DELIVERY
     config = load_json(DEFAULT_CONFIG_PATH, {})
     if not isinstance(config, dict):
         config = {}
@@ -126,10 +125,6 @@ def load_config() -> None:
     )
     visible = config.get("visible_delivery") or {}
     VISIBLE_DELIVERY = visible if isinstance(visible, dict) else {}
-    try:
-        WAKE_SUPPRESSION_SECONDS = int(config.get("wake_suppression_seconds", WAKE_SUPPRESSION_SECONDS))
-    except Exception:
-        WAKE_SUPPRESSION_SECONDS = 30 * 60
 
 
 def run(cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
@@ -244,13 +239,11 @@ def main() -> int:
 
     signature = stable_signature(result)
     now_ts = time.time()
-    last_wake_ts = float(state.get("last_wake_ts") or 0)
-    last_wake_succeeded = state.get("last_wake_returncode") == 0
-    if last_wake_succeeded and state.get("last_wake_signature") == signature and now_ts - last_wake_ts < WAKE_SUPPRESSION_SECONDS:
-        state["last_suppressed_at"] = now_iso()
-        state["last_suppressed_signature"] = signature
-        save_json(STATE_PATH, state)
-        return 0
+    # Do not treat delivery to the main session as successful recovery.
+    # Durable ledger records such as wake-delivered, terminal-ref-handled,
+    # wait-reminder-sent, or complete-reported are the suppression mechanism.
+    # If the main session fails to reconcile a recovery packet, the next
+    # deterministic check must be allowed to wake it again.
 
     try:
         prompt = wake_prompt(result)

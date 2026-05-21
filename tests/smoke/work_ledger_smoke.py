@@ -1754,10 +1754,10 @@ def smoke_insufficient_recovery_context() -> dict[str, Any]:
             "--success-criteria",
             json.dumps(["insufficient context is explicit"]),
         )
-        run(root, "complete", "--work-id", work_id, "--note", "completed without expected outputs")
+        age_events(root, work_id, seconds=1801)
 
         scan = run(root, "scan", "--cooldown-seconds", "0")
-        assert_true(scan["has_recoveries"], "missing expected outputs should still produce a packet")
+        assert_true(scan["has_recoveries"], "missing recovery anchor should still produce a packet")
         packet = scan["recoveries"][0]
         assert_true(packet["reason"] == "insufficient_recovery_context", "missing context should be explicit")
         assert_true("recovery_anchor" in packet["recovery_context_gaps"], "recovery_anchor gap should be listed")
@@ -1802,12 +1802,60 @@ def smoke_missing_expected_outputs_context() -> dict[str, Any]:
         scan = run(root, "scan", "--cooldown-seconds", "0")
         assert_true(scan["has_recoveries"], "missing expected outputs should produce a packet")
         packet = scan["recoveries"][0]
-        assert_true(packet["reason"] == "insufficient_recovery_context", "missing expected outputs should be explicit")
+        assert_true(packet["reason"] == "completed_unreported", "unreported completion should not be masked by context gaps")
         assert_true("expected_outputs" in packet["recovery_context_gaps"], "expected_outputs gap should be listed")
         return {
             "work_id": work_id,
             "reason": packet["reason"],
             "gaps": packet["recovery_context_gaps"],
+        }
+
+
+def smoke_quick_start_visible_stale_defaults() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="work-ledger-smoke-") as tmp:
+        root = Path(tmp)
+        visible_delivery = json.dumps({"channel": "telegram", "target": "test-user"})
+
+        coding = run(
+            root,
+            "quick-start",
+            "--kind",
+            "coding",
+            "--work-id",
+            "smoke-quick-coding-stale",
+            "--summary",
+            "visible coding work",
+            "--owner-session-key",
+            "agent:main:telegram:direct:test-user",
+            "--visible-delivery",
+            visible_delivery,
+            "--expected-outputs",
+            "code diff",
+            "--no-artifact-expected",
+        )
+        local_files = run(
+            root,
+            "quick-start",
+            "--kind",
+            "local-files",
+            "--work-id",
+            "smoke-quick-local-files-stale",
+            "--summary",
+            "visible local file work",
+            "--owner-session-key",
+            "agent:main:telegram:direct:test-user",
+            "--visible-delivery",
+            visible_delivery,
+            "--expected-outputs",
+            "file diff",
+            "--no-artifact-expected",
+        )
+        states = {item["work_id"]: item for item in run(root, "state")["items"]}
+        assert_true(states[coding["work_id"]]["stale_after_seconds"] == 12 * 60, "coding quick-start should use 12 minute stale threshold")
+        assert_true(states[local_files["work_id"]]["stale_after_seconds"] == 15 * 60, "local-files quick-start should use 15 minute stale threshold")
+        return {
+            "coding_stale_after_seconds": states[coding["work_id"]]["stale_after_seconds"],
+            "local_files_stale_after_seconds": states[local_files["work_id"]]["stale_after_seconds"],
         }
 
 
@@ -2313,6 +2361,96 @@ def smoke_resume_start_does_not_hide_unreported_completion() -> dict[str, Any]:
         }
 
 
+def smoke_unreported_terminal_precedes_terminal_refs() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="work-ledger-smoke-") as tmp:
+        root = Path(tmp)
+        visible_delivery = json.dumps({"channel": "telegram", "target": "telegram:test-user"})
+        completed_work = "smoke-unreported-terminal-priority"
+        terminal_ref_work = "smoke-terminal-ref-secondary"
+        ref = "agent:main:subagent:terminal-secondary"
+
+        run(
+            root,
+            "start",
+            "--work-id",
+            completed_work,
+            "--owner-session-key",
+            "agent:main:telegram:direct:test-user",
+            "--visible-delivery",
+            visible_delivery,
+            "--request-summary",
+            "Smoke unreported terminal priority",
+            "--expected-outputs",
+            "visible report",
+            "--no-artifact-expected",
+            "--checklist",
+            json.dumps(["complete", "report"]),
+            "--success-criteria",
+            json.dumps(["unreported terminal beats terminal refs"]),
+        )
+        run(root, "complete", "--work-id", completed_work, "--note", "done but unreported")
+
+        run(
+            root,
+            "start",
+            "--work-id",
+            terminal_ref_work,
+            "--owner-session-key",
+            "agent:main:telegram:direct:test-user",
+            "--visible-delivery",
+            visible_delivery,
+            "--request-summary",
+            "Smoke terminal ref secondary",
+            "--expected-outputs",
+            "terminal review",
+            "--checklist",
+            json.dumps(["wait", "terminal-ref"]),
+            "--success-criteria",
+            json.dumps(["terminal ref remains secondary"]),
+        )
+        run(
+            root,
+            "wait",
+            "--work-id",
+            terminal_ref_work,
+            "--status",
+            "waiting_subagent",
+            "--subagent-session-keys",
+            ref,
+            "--note",
+            "waiting for terminal review",
+        )
+
+        original_lookup = LEDGER_MODULE.load_openclaw_task_lookup
+
+        def fake_lookup(lookup: str) -> tuple[dict[str, Any] | None, str | None]:
+            if lookup == ref:
+                return {
+                    "taskId": "task-terminal-secondary",
+                    "runId": "run-terminal-secondary",
+                    "runtime": "subagent",
+                    "status": "succeeded",
+                    "terminalSummary": "completed",
+                    "endedAt": 12345,
+                }, None
+            return None, None
+
+        try:
+            LEDGER_MODULE.load_openclaw_task_lookup = fake_lookup
+            check = LEDGER_MODULE.watchdog_check(root, cooldown_seconds=0)
+        finally:
+            LEDGER_MODULE.load_openclaw_task_lookup = original_lookup
+
+        assert_true(check["wake_reason"] == "recovery", "unreported terminal recovery should beat terminal ref reconciliation")
+        assert_true(check["recoveries"][0]["work_id"] == completed_work, "unreported terminal work should be first recovery")
+        assert_true(check["recoveries"][0]["reason"] == "completed_unreported", "recovery reason should remain completed_unreported")
+        return {
+            "wake_reason": check["wake_reason"],
+            "recovery_reason": check["recoveries"][0]["reason"],
+            "recovered_work_id": check["recoveries"][0]["work_id"],
+        }
+
+
 def smoke_terminal_refs_precede_stale_recovery() -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="work-ledger-smoke-") as tmp:
         root = Path(tmp)
@@ -2496,12 +2634,14 @@ def main() -> int:
             "orphan_uses_idle_activity_for_freshness": smoke_orphan_uses_idle_activity_for_freshness(),
             "insufficient_recovery_context": smoke_insufficient_recovery_context(),
             "missing_expected_outputs_context": smoke_missing_expected_outputs_context(),
+            "quick_start_visible_stale_defaults": smoke_quick_start_visible_stale_defaults(),
             "per_entry_stale_after": smoke_per_entry_stale_after(),
             "waiting_user_minimum_stale_after": smoke_waiting_user_minimum_stale_after(),
             "waiting_user_wait_does_not_refresh_activity": smoke_waiting_user_wait_does_not_refresh_activity(),
             "prune_terminal_dry_run_and_apply": smoke_prune_terminal_dry_run_and_apply(),
             "gateway_side_effect_idempotency_policy": smoke_gateway_side_effect_idempotency_policy(),
             "resume_start_does_not_hide_unreported_completion": smoke_resume_start_does_not_hide_unreported_completion(),
+            "unreported_terminal_precedes_terminal_refs": smoke_unreported_terminal_precedes_terminal_refs(),
             "terminal_refs_precede_stale_recovery": smoke_terminal_refs_precede_stale_recovery(),
             "shared_terminal_ref_surfaces_each_work": smoke_shared_terminal_ref_surfaces_each_work(),
         },

@@ -89,7 +89,7 @@ def test_runner_help_without_config() -> None:
     assert_true("Usage:" in output and "OPENCLAW_LEDGER_CONFIG" in output, "runner --help should explain config")
 
 
-def test_failed_wake_does_not_arm_suppression() -> None:
+def test_delivery_does_not_suppress_unresolved_wake() -> None:
     runner = load_module("work_ledger_watchdog_runner_smoke_target", RUNNER_PATH)
     non_clean = {
         "ok": True,
@@ -119,8 +119,8 @@ def test_failed_wake_does_not_arm_suppression() -> None:
         assert_true(runner.main() == 1, "failed wake should return nonzero")
         assert_true(runner.main() == 0, "same signature should retry after failed wake")
         assert_true(wake_calls == [1, 0], f"expected failed wake then retry, got {wake_calls}")
-        assert_true(runner.main() == 0, "same signature should suppress after successful wake")
-        assert_true(wake_calls == [1, 0], "successful wake should arm duplicate suppression")
+        assert_true(runner.main() == 0, "same unresolved signature should wake again after delivery")
+        assert_true(wake_calls == [1, 0, 0], "event delivery alone must not suppress unresolved recovery")
 
 
 def test_wake_exception_persists_failed_metadata() -> None:
@@ -191,10 +191,10 @@ def test_referenced_terminal_task_status_vocabulary() -> None:
 def main() -> None:
     test_runner_has_no_private_defaults()
     test_runner_help_without_config()
-    test_failed_wake_does_not_arm_suppression()
+    test_delivery_does_not_suppress_unresolved_wake()
     test_wake_exception_persists_failed_metadata()
     test_referenced_terminal_task_status_vocabulary()
-    print(json.dumps({"ok": True, "checked": ["runner-public-defaults", "runner-help", "configured-root", "wake-failure-suppression", "wake-exception-state", "referenced-terminal-statuses"]}, indent=2))
+    print(json.dumps({"ok": True, "checked": ["runner-public-defaults", "runner-help", "configured-root", "wake-delivery-does-not-suppress", "wake-exception-state", "referenced-terminal-statuses"]}, indent=2))
 
 
 if __name__ == "__main__":
