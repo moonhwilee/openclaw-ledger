@@ -312,10 +312,12 @@ It is intentionally small:
 - load local config from `OPENCLAW_LEDGER_CONFIG` or
   `~/.openclaw/ledger/config.json`
 - run `openclaw-ledger watchdog-check --include-cron`
+- pass the configured `openclaw_path` to ledger task lookups through
+  `OPENCLAW_BIN`
 - return silently when the result is clean
 - wake the configured main session only for non-clean results
-- suppress duplicate wakeups for the same non-clean signature after a successful
-  wake
+- record wake attempt metadata, but do not suppress unresolved repeat wakeups
+  solely because event delivery succeeded
 
 For diagnostics:
 

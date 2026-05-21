@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -108,6 +109,7 @@ def test_delivery_does_not_suppress_unresolved_wake() -> None:
         def fake_run(cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
             if "watchdog-check" in cmd:
                 assert_true("--root" in cmd and cmd[cmd.index("--root") + 1] == tmp, "runner should pass configured workspace as ledger root")
+                assert_true(os.environ.get("OPENCLAW_BIN") == str(runner.OPENCLAW), "runner should expose configured openclaw_path to ledger child")
                 return completed(cmd, 0, stdout=clean_json)
             if cmd[:3] == [str(runner.OPENCLAW), "system", "event"]:
                 code = wake_returncodes.pop(0) if wake_returncodes else 0
@@ -121,6 +123,37 @@ def test_delivery_does_not_suppress_unresolved_wake() -> None:
         assert_true(wake_calls == [1, 0], f"expected failed wake then retry, got {wake_calls}")
         assert_true(runner.main() == 0, "same unresolved signature should wake again after delivery")
         assert_true(wake_calls == [1, 0, 0], "event delivery alone must not suppress unresolved recovery")
+
+
+def test_missing_prompt_uses_fallback_wake() -> None:
+    runner = load_module("work_ledger_watchdog_runner_missing_prompt_target", RUNNER_PATH)
+    non_clean = {
+        "ok": True,
+        "status": "needs_wake",
+        "needs_wake": True,
+        "wake_reason": "recovery",
+        "recoveries": [{"work_id": "w1", "recovery_fingerprint": "rf1"}],
+    }
+    wake_texts: list[str] = []
+
+    with tempfile.TemporaryDirectory() as tmp:
+        write_runner_config(runner, tmp)
+        runner.PROMPT_PATH.unlink()
+
+        def fake_run(cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
+            if "watchdog-check" in cmd:
+                return completed(cmd, 0, stdout=json.dumps(non_clean))
+            if cmd[:3] == [str(runner.OPENCLAW), "system", "event"]:
+                wake_texts.append(cmd[cmd.index("--text") + 1])
+                return completed(cmd, 0, stdout="{}")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        runner.run = fake_run
+        assert_true(runner.main() == 0, "missing packaged prompt should fall back and still wake")
+
+    assert_true(wake_texts, "fallback wake should include prompt text")
+    assert_true("Work Ledger Watchdog v1 Wake Handler" in wake_texts[0], "fallback prompt should identify recovery handler")
+    assert_true("runner_prompt_error" in wake_texts[0], "fallback wake should include prompt read error evidence")
 
 
 def test_wake_exception_persists_failed_metadata() -> None:
@@ -192,9 +225,10 @@ def main() -> None:
     test_runner_has_no_private_defaults()
     test_runner_help_without_config()
     test_delivery_does_not_suppress_unresolved_wake()
+    test_missing_prompt_uses_fallback_wake()
     test_wake_exception_persists_failed_metadata()
     test_referenced_terminal_task_status_vocabulary()
-    print(json.dumps({"ok": True, "checked": ["runner-public-defaults", "runner-help", "configured-root", "wake-delivery-does-not-suppress", "wake-exception-state", "referenced-terminal-statuses"]}, indent=2))
+    print(json.dumps({"ok": True, "checked": ["runner-public-defaults", "runner-help", "configured-root", "configured-openclaw-bin", "wake-delivery-does-not-suppress", "missing-prompt-fallback", "wake-exception-state", "referenced-terminal-statuses"]}, indent=2))
 
 
 if __name__ == "__main__":

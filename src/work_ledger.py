@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -65,6 +66,12 @@ SIDE_EFFECT_CLASSES = {
     "destructive",
     "gateway_runtime",
 }
+
+
+def openclaw_command() -> str:
+    return os.environ.get("OPENCLAW_BIN") or shutil.which("openclaw") or "openclaw"
+
+
 EVENT_TYPES = {
     "start",
     "progress",
@@ -1134,7 +1141,7 @@ def make_recovery_packet(root: Path, state: dict[str, Any], reason: str) -> dict
             "This work is waiting for user input and may not be stuck. Reconcile current conversation "
             "state first. If the user has answered, continue the work, verify, send the visible completion "
             "report, then record complete-reported with the delivery id. If still blocked on user input, send at most one concise "
-            "waiting reminder and record a fresh wait event instead of report-sent."
+            "waiting reminder, then record wait-reminder-sent with the visible delivery route and delivery id."
         )
     else:
         recovery_instruction = (
@@ -1367,7 +1374,7 @@ def collect_active_task_ref_details(root: Path) -> list[dict[str, Any]]:
 def load_openclaw_task_lookup(lookup: str) -> tuple[dict[str, Any] | None, str | None]:
     try:
         proc = subprocess.run(
-            ["openclaw", "tasks", "show", "--json", lookup],
+            [openclaw_command(), "tasks", "show", "--json", lookup],
             check=False,
             capture_output=True,
             text=True,
@@ -1489,7 +1496,7 @@ def find_referenced_terminal_tasks(root: Path) -> dict[str, Any]:
 def load_openclaw_tasks(status: str) -> tuple[list[dict[str, Any]], str | None]:
     try:
         proc = subprocess.run(
-            ["openclaw", "tasks", "list", "--json", "--status", status],
+            [openclaw_command(), "tasks", "list", "--json", "--status", status],
             check=False,
             capture_output=True,
             text=True,

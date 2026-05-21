@@ -44,6 +44,15 @@ STATE_PATH = Path(os.environ.get("OPENCLAW_LEDGER_STATE_PATH", "~/.openclaw/ledg
 PROMPT_PATH = DEFAULT_PROMPT_PATH
 SESSION_KEY = os.environ.get("OPENCLAW_LEDGER_OWNER_SESSION_KEY") or ""
 VISIBLE_DELIVERY: dict[str, Any] = {}
+FALLBACK_WAKE_PROMPT = """# Work Ledger Watchdog v1 Wake Handler
+
+Priority:
+- Treat this system event as recovery work before answering ordinary chat context.
+- Inspect the included watchdog-check JSON and reconcile unfinished Ledger work.
+- Do not repeat external or destructive side effects without explicit user approval.
+- Send a visible completion, waiting, or blocked report only after the safe recovery action is clear.
+- Record durable Ledger proof after acting, such as wake-delivered, wait-reminder-sent, terminal-ref-handled, or complete-reported.
+"""
 
 
 def usage() -> str:
@@ -160,7 +169,14 @@ def stable_signature(result: dict[str, Any]) -> str:
 
 
 def wake_prompt(result: dict[str, Any]) -> str:
-    base = PROMPT_PATH.read_text(encoding="utf-8")
+    try:
+        base = PROMPT_PATH.read_text(encoding="utf-8")
+    except Exception as exc:
+        result = {
+            **result,
+            "runner_prompt_error": f"failed to read watchdog prompt {PROMPT_PATH}: {exc}",
+        }
+        base = FALLBACK_WAKE_PROMPT
     return (
         base
         + "\n\n---\n\n"
@@ -182,6 +198,7 @@ def main() -> int:
         return 2
     os.environ["PATH"] = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
     load_config()
+    os.environ["OPENCLAW_BIN"] = str(OPENCLAW)
     state = load_json(STATE_PATH, {})
     started_at = now_iso()
     try:

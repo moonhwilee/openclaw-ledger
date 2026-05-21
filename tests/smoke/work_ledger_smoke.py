@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import os
 import subprocess
 import sys
 import tempfile
@@ -974,6 +975,47 @@ def smoke_referenced_codex_uuid_not_terminal_task_lookup() -> dict[str, Any]:
         }
 
 
+def smoke_openclaw_bin_env_used_for_task_commands() -> dict[str, Any]:
+    custom_openclaw = "/tmp/smoke-custom-openclaw"
+    calls: list[list[str]] = []
+    original_run = LEDGER_MODULE.subprocess.run
+    original_env = os.environ.get("OPENCLAW_BIN")
+
+    def fake_run(cmd: list[str], *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        if cmd == [custom_openclaw, "tasks", "show", "--json", "task-env"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"status": "running", "taskId": cmd[-1]}), stderr="")
+        if cmd == [custom_openclaw, "tasks", "list", "--json", "--status", "running"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"tasks": []}), stderr="")
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    try:
+        os.environ["OPENCLAW_BIN"] = custom_openclaw
+        LEDGER_MODULE.subprocess.run = fake_run
+        task, error = LEDGER_MODULE.load_openclaw_task_lookup("task-env")
+        tasks, list_error = LEDGER_MODULE.load_openclaw_tasks("running")
+    finally:
+        LEDGER_MODULE.subprocess.run = original_run
+        if original_env is None:
+            os.environ.pop("OPENCLAW_BIN", None)
+        else:
+            os.environ["OPENCLAW_BIN"] = original_env
+
+    assert_true(error is None and task and task["taskId"] == "task-env", "task lookup should parse fake task result")
+    assert_true(list_error is None and tasks == [], "task list should parse fake task list result")
+    assert_true(
+        calls == [
+            [custom_openclaw, "tasks", "show", "--json", "task-env"],
+            [custom_openclaw, "tasks", "list", "--json", "--status", "running"],
+        ],
+        "OPENCLAW_BIN should be used with exact task command argv",
+    )
+    return {
+        "command_count": len(calls),
+        "command_bins": [call[0] for call in calls],
+    }
+
+
 def smoke_visible_update_route_does_not_contaminate_report_route() -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="work-ledger-smoke-") as tmp:
         root = Path(tmp)
@@ -1811,6 +1853,44 @@ def smoke_missing_expected_outputs_context() -> dict[str, Any]:
         }
 
 
+def smoke_failed_unreported_context_gaps_not_masked() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="work-ledger-smoke-") as tmp:
+        root = Path(tmp)
+        work_id = "smoke-failed-context-gaps"
+
+        run(
+            root,
+            "start",
+            "--work-id",
+            work_id,
+            "--owner-session-key",
+            "agent:main:telegram:direct:test-user",
+            "--visible-delivery",
+            json.dumps({"channel": "telegram", "target": "test-user"}),
+            "--request-summary",
+            "Smoke test failed_unreported with missing context",
+            "--side-effect-class",
+            "local_files",
+            "--checklist",
+            json.dumps(["start", "fail"]),
+            "--success-criteria",
+            json.dumps(["failed_unreported is not masked by context gaps"]),
+        )
+        run(root, "fail", "--work-id", work_id, "--note", "failed without expected outputs")
+
+        scan = run(root, "scan", "--cooldown-seconds", "0")
+        assert_true(scan["has_recoveries"], "failed_unreported should produce a packet")
+        packet = scan["recoveries"][0]
+        assert_true(packet["reason"] == "failed_unreported", "failed terminal state should not be masked by context gaps")
+        assert_true("expected_outputs" in packet["recovery_context_gaps"], "expected_outputs gap should be listed")
+        assert_true("recovery_anchor" in packet["recovery_context_gaps"], "recovery_anchor gap should be listed")
+        return {
+            "work_id": work_id,
+            "reason": packet["reason"],
+            "gaps": packet["recovery_context_gaps"],
+        }
+
+
 def smoke_quick_start_visible_stale_defaults() -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="work-ledger-smoke-") as tmp:
         root = Path(tmp)
@@ -1980,12 +2060,53 @@ def smoke_waiting_user_minimum_stale_after() -> dict[str, Any]:
         packet = stale["recoveries"][0]
         assert_true(packet["reason"].startswith("waiting_user_stale_"), "reason should reflect waiting_user stale state")
         assert_true(packet["stale_after_seconds"] == 24 * 60 * 60, "packet should expose the waiting_user threshold")
+        assert_true("wait-reminder-sent" in packet["required_recovery_instruction"], "waiting_user packet should require wait-reminder-sent proof")
+        assert_true("fresh wait event" not in packet["required_recovery_instruction"], "waiting_user packet should not ask for ambiguous wait event proof")
         return {
             "work_id": work_id,
             "early_wake_suppressed": not fresh["has_recoveries"],
             "one_hour_wake_suppressed": not still_fresh["has_recoveries"],
             "stale_after_seconds": packet["stale_after_seconds"],
             "reason": packet["reason"],
+        }
+
+
+def smoke_waiting_user_context_gaps_not_masked() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="work-ledger-smoke-") as tmp:
+        root = Path(tmp)
+        work_id = "smoke-waiting-user-context-gaps"
+
+        run(
+            root,
+            "start",
+            "--work-id",
+            work_id,
+            "--owner-session-key",
+            "agent:main:telegram:direct:test-user",
+            "--visible-delivery",
+            json.dumps({"channel": "telegram", "target": "test-user"}),
+            "--request-summary",
+            "Smoke test waiting_user stale with missing context",
+            "--side-effect-class",
+            "local_files",
+            "--checklist",
+            json.dumps(["start", "wait"]),
+            "--success-criteria",
+            json.dumps(["waiting_user stale is not masked by context gaps"]),
+        )
+        run(root, "wait", "--work-id", work_id, "--status", "waiting_user", "--note", "waiting for user")
+        age_events(root, work_id, seconds=(24 * 60 * 60) + 1)
+
+        scan = run(root, "scan", "--cooldown-seconds", "0")
+        assert_true(scan["has_recoveries"], "waiting_user stale should produce a packet even with context gaps")
+        packet = scan["recoveries"][0]
+        assert_true(packet["reason"].startswith("waiting_user_stale_"), "waiting_user stale reason should not be masked")
+        assert_true("expected_outputs" in packet["recovery_context_gaps"], "expected_outputs gap should be listed")
+        assert_true("recovery_anchor" in packet["recovery_context_gaps"], "recovery_anchor gap should be listed")
+        return {
+            "work_id": work_id,
+            "reason": packet["reason"],
+            "gaps": packet["recovery_context_gaps"],
         }
 
 
@@ -2626,6 +2747,7 @@ def main() -> int:
             "active_visible_delivery_recovery_reconciles_before_duplicate": smoke_active_visible_delivery_recovery_reconciles_before_duplicate(),
             "terminal_visible_delivery_recovery_reconciles_before_duplicate": smoke_terminal_visible_delivery_recovery_reconciles_before_duplicate(),
             "referenced_codex_uuid_not_terminal_task_lookup": smoke_referenced_codex_uuid_not_terminal_task_lookup(),
+            "openclaw_bin_env_used_for_task_commands": smoke_openclaw_bin_env_used_for_task_commands(),
             "visible_update_route_does_not_contaminate_report_route": smoke_visible_update_route_does_not_contaminate_report_route(),
             "report_sent_rejects_active_work": smoke_report_sent_rejects_active_work(),
             "complete_reported_records_terminal_proof": smoke_complete_reported_records_terminal_proof(),
@@ -2634,9 +2756,11 @@ def main() -> int:
             "orphan_uses_idle_activity_for_freshness": smoke_orphan_uses_idle_activity_for_freshness(),
             "insufficient_recovery_context": smoke_insufficient_recovery_context(),
             "missing_expected_outputs_context": smoke_missing_expected_outputs_context(),
+            "failed_unreported_context_gaps_not_masked": smoke_failed_unreported_context_gaps_not_masked(),
             "quick_start_visible_stale_defaults": smoke_quick_start_visible_stale_defaults(),
             "per_entry_stale_after": smoke_per_entry_stale_after(),
             "waiting_user_minimum_stale_after": smoke_waiting_user_minimum_stale_after(),
+            "waiting_user_context_gaps_not_masked": smoke_waiting_user_context_gaps_not_masked(),
             "waiting_user_wait_does_not_refresh_activity": smoke_waiting_user_wait_does_not_refresh_activity(),
             "prune_terminal_dry_run_and_apply": smoke_prune_terminal_dry_run_and_apply(),
             "gateway_side_effect_idempotency_policy": smoke_gateway_side_effect_idempotency_policy(),
